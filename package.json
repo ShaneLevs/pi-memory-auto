@@ -1,0 +1,20 @@
+{
+  "name": "pi-memory-auto",
+  "version": "0.1.0",
+  "description": "Memory system extension for the pi coding agent: two-layer markdown memory (global + project), snapshot injection, keyword/tag/recent search, turn-based auto-extraction, and automatic main-file consolidation.",
+  "type": "module",
+  "main": "index.ts",
+  "scripts": {
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": ["pi", "extension", "memory"],
+  "license": "MIT",
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^1.1.0",
+    "typescript": "^5.7.0"
+  },
+  "dependencies": {
+    "typebox": "^1.0.0"
+  }
+}
