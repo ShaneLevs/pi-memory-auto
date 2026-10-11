@@ -14,12 +14,13 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { loadConfig } from "./src/config.ts";
-import { INJECTION_PREAMBLE, MAIN_FILE, PROJECT_CATEGORY_FILES, GLOBAL_CATEGORY_FILES, WRITABLE_FILES, CLASSIFICATION_RUBRIC } from "./src/constants.ts";
+import { INJECTION_PREAMBLE, MAIN_FILE, PROJECT_CATEGORY_FILES, GLOBAL_CATEGORY_FILES, WRITABLE_FILES, CLASSIFICATION_RUBRIC, LLM_TIMEOUT_MS } from "./src/constants.ts";
 import { Consolidator } from "./src/consolidator.ts";
 import { isTrivialSession, runReview, transcriptFromMessages } from "./src/extractor.ts";
 import { runHandoff } from "./src/handoff.ts";
 import { formatSearchResult, loadAllEntries, searchEntries } from "./src/search.ts";
 import { SnapshotManager } from "./src/snapshot.ts";
+import { countTurnsFromBranch } from "./src/turns.ts";
 import { Debouncer, FileMutex, ProcessLock, appendEntry, isWritableTarget, mainCleanLength } from "./src/store.ts";
 import type { Layer, SearchMode } from "./src/types.ts";
 
@@ -31,10 +32,53 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 
 	let projectRoot = process.cwd();
 	let projectName = path.basename(projectRoot);
-	let turnCount = 0;
 	let reviewInFlight = false;
-	let messageCounter = 0;
 	const consolidator = new Consolidator({ globalDir: config.globalDir, projectRoot, mutex });
+
+	/** Count conversation turns from the session branch (stateless).
+	 *  Turn = one user + one assistant message exchange. Compaction entries are
+	 *  not messages, but the history before them stays in the branch, so all
+	 *  prior turns are included. Survives reload/resume naturally. */
+	function countTurns(ctx: ExtensionContext): number {
+		return countTurnsFromBranch(ctx.sessionManager.getBranch() as never);
+	}
+
+	/** Extract user/assistant text messages from a branch tail. */
+	function transcriptFromBranch(ctx: ExtensionContext, tail: number): { role: string; text: string }[] {
+		const messages: { role: string; text: string }[] = [];
+		for (const e of ctx.sessionManager.getBranch().slice(-tail)) {
+			if (e.type !== "message") continue;
+			const m = e.message as { role?: string; content?: unknown };
+			if (!m?.role || (m.role !== "user" && m.role !== "assistant")) continue;
+			const content = m.content;
+			const text = Array.isArray(content)
+				? content.filter((c): c is { type: "text"; text: string } => (c as { type?: string }).type === "text").map((c) => c.text).join("\n")
+				: typeof content === "string" ? content : "";
+			messages.push({ role: m.role, text });
+		}
+		return messages;
+	}
+
+	/** Run one background extraction review. Fire-and-forget, never blocks. */
+	function scheduleReview(ctx: ExtensionContext, timeoutMs?: number): void {
+		if (reviewInFlight) return;
+		const { model, registry } = modelInfo(ctx);
+		if (!model || !registry) return;
+		const messages = transcriptFromBranch(ctx, 40);
+		if (isTrivialSession(messages.length)) return;
+		const transcript = transcriptFromMessages(messages);
+		if (transcript.trim().length === 0) return;
+
+		reviewInFlight = true;
+		void runReview({ globalDir: config.globalDir, projectRoot, mutex, plock: new ProcessLock(config.globalDir) }, transcript, model, registry, timeoutMs)
+			.then((written) => {
+				if (written.length > 0 && ctx.hasUI) ctx.ui.notify(`memory-auto: saved ${written.length} memory entries`, "info");
+			})
+			.catch(() => undefined)
+			.finally(() => {
+				reviewInFlight = false;
+			});
+	}
 
 	// Session model access helper (model may be undefined early).
 	function modelInfo(ctx: ExtensionContext) {
@@ -133,8 +177,6 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 		projectRoot = ctx.cwd;
 		projectName = path.basename(projectRoot);
 		snapshots.reset();
-		turnCount = 0;
-		messageCounter = 0;
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
@@ -157,39 +199,11 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 
 	pi.on("turn_end", async (_event, ctx) => {
 		ctxRef = ctx;
-		turnCount++;
-		messageCounter += 2;
-		if (turnCount % config.reviewTurns !== 0 || reviewInFlight) return;
-		const { model, registry } = modelInfo(ctx);
-		if (!model || !registry) return;
-		if (isTrivialSession(messageCounter)) return;
-
-		// Gather recent transcript from the branch (assistant+user messages).
-		const branch = ctx.sessionManager.getBranch();
-		const messages: { role: string; text: string }[] = [];
-		for (const e of branch.slice(-40)) {
-			if (e.type !== "message") continue;
-			const m = e.message as { role?: string; content?: unknown };
-			if (!m?.role || (m.role !== "user" && m.role !== "assistant")) continue;
-			const content = m.content;
-			const text = Array.isArray(content)
-				? content.filter((c): c is { type: "text"; text: string } => (c as { type?: string }).type === "text").map((c) => c.text).join("\n")
-				: typeof content === "string" ? content : "";
-			messages.push({ role: m.role, text });
-		}
-		const transcript = transcriptFromMessages(messages);
-		if (transcript.trim().length === 0) return;
-
-		reviewInFlight = true;
-		// Fire-and-forget: never block the conversation.
-		void runReview({ globalDir: config.globalDir, projectRoot, mutex, plock: new ProcessLock(config.globalDir) }, transcript, model, registry)
-			.then((written) => {
-				if (written.length > 0 && ctx.hasUI) ctx.ui.notify(`memory-auto: saved ${written.length} memory entries`, "info");
-			})
-			.catch(() => undefined)
-			.finally(() => {
-				reviewInFlight = false;
-			});
+		// Stateless trigger: count total turns from the branch each turn;
+		// extract at every multiple of reviewTurns (e.g. 8 → turns 8, 16, 24...).
+		// Includes turns before compaction; survives reload/resume (no counter to lose).
+		if (countTurns(ctx) % config.reviewTurns !== 0 || reviewInFlight) return;
+		scheduleReview(ctx);
 		return undefined;
 	});
 
@@ -199,7 +213,6 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 		// Fire-and-forget handoff so important state survives compaction.
 		const { model, registry } = modelInfo(ctx);
 		if (model && registry) {
-			const branch = ctx.sessionManager.getBranch();
 			const messages: { role: string; text: string }[] = [];
 			for (const e of [...event.preparation.messagesToSummarize].slice(-30)) {
 				const m = e as unknown as { role?: string; content?: unknown };
@@ -218,8 +231,19 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 		return undefined; // don't customize compaction itself
 	});
 
-	pi.on("session_shutdown", async () => {
+	// Exit flush: when the user quits the session, run one final extraction so
+	// the tail of the conversation (turns since the last multiple trigger) is
+	// not lost. pi awaits session_shutdown handlers before exiting. reload/new/
+	// resume/fork do not flush (runtime teardown, not end of conversation).
+	// Short self-timeout so quitting never hangs.
+	pi.on("session_shutdown", async (event, ctx) => {
 		debouncer.clearAll();
+		if (event.reason !== "quit") return;
+		try {
+			scheduleReview(ctx, SHUTDOWN_FLUSH_TIMEOUT_MS);
+		} catch {
+			// Never block shutdown.
+		}
 	});
 
 	// Silence unused warnings for names kept for clarity.
@@ -230,3 +254,6 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 
 // Local import kept at bottom to avoid top-level name clash in the factory.
 import path from "node:path";
+
+/** Max time the quit-flush review may take; keeps session exit snappy. */
+const SHUTDOWN_FLUSH_TIMEOUT_MS = Math.min(30_000, LLM_TIMEOUT_MS);

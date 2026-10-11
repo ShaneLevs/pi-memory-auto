@@ -99,6 +99,7 @@ export async function runReview(
 	transcript: string,
 	model: unknown,
 	registry: unknown,
+	timeoutMs?: number,
 ): Promise<MemoryEntry[]> {
 	const written: MemoryEntry[] = [];
 	if (transcript.trim().length === 0) return written;
@@ -110,6 +111,7 @@ export async function runReview(
 			systemPrompt: REVIEW_SYSTEM_PROMPT,
 			userPrompt: buildReviewUserPrompt(transcript),
 			maxTokens: 2048,
+			...(timeoutMs !== undefined ? { timeoutMs } : {}),
 		},
 	);
 	if (!result.ok) return written;
