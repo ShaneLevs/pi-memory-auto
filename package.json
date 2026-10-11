@@ -1,13 +1,17 @@
 {
-  "name": "pi-memory-auto",
+  "name": "@shanelevs/pi-memory-auto",
   "version": "0.1.0",
-  "description": "Memory system extension for the pi coding agent: two-layer markdown memory (global + project), snapshot injection, keyword/tag/recent search, turn-based auto-extraction, and automatic main-file consolidation.",
+  "description": "🧠 Memory extension for the pi coding agent — two-layer markdown memory (global + project), cache-safe snapshot injection, keyword/tag/recent search, turn-based auto-extraction, auto-consolidation. Zero heavy deps.",
   "type": "module",
   "main": "index.ts",
-  "scripts": {
-    "test": "node --experimental-strip-types --test test/*.test.ts",
-    "typecheck": "tsc --noEmit"
+  "license": "MIT",
+  "author": "Shane",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ShaneLevs/pi-memory-auto.git"
   },
+  "homepage": "https://github.com/ShaneLevs/pi-memory-auto#readme",
+  "bugs": "https://github.com/ShaneLevs/pi-memory-auto/issues",
   "keywords": [
     "pi",
     "pi-coding-agent",
@@ -20,12 +24,23 @@
     "snapshot-injection",
     "markdown"
   ],
-  "license": "MIT",
-  "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^1.1.0",
-    "typescript": "^5.7.0"
+  "pi": {
+    "extensions": ["./index.ts"]
   },
-  "dependencies": {
-    "typebox": "^1.0.0"
+  "files": [
+    "index.ts",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run typecheck && npm test"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
   }
 }
