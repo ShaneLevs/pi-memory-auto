@@ -8,7 +8,18 @@
     "test": "node --experimental-strip-types --test test/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
-  "keywords": ["pi", "extension", "memory"],
+  "keywords": [
+    "pi",
+    "pi-coding-agent",
+    "pi-package",
+    "pi-extension",
+    "memory",
+    "persistent-memory",
+    "agent-memory",
+    "two-tier-memory",
+    "snapshot-injection",
+    "markdown"
+  ],
   "license": "MIT",
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^1.1.0",
