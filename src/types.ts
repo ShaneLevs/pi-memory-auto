@@ -73,6 +73,8 @@ export interface MemoryConfig {
 	consolidateThreshold: number;
 	/** Search page size. */
 	pageSize: number;
+	/** maxTokens for background LLM calls (extraction / handoff / consolidation). */
+	llmMaxTokens: number;
 }
 
 /** Result details attached to tool results for UI rendering. */

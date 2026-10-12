@@ -9,6 +9,13 @@ test("loadConfig defaults", () => {
 	assert.equal(c.reviewTurns, 10);
 	assert.match(c.globalDir, /memory-auto$/);
 	assert.equal(c.pageSize, 10);
+	assert.equal(c.llmMaxTokens, 10_000);
+});
+
+test("loadConfig llmMaxTokens env override + clamping", () => {
+	assert.equal(loadConfig({ PI_MEMORY_AUTO_LLM_MAX_TOKENS: "16000" }).llmMaxTokens, 16000);
+	assert.equal(loadConfig({ PI_MEMORY_AUTO_LLM_MAX_TOKENS: "abc" }).llmMaxTokens, 10_000);
+	assert.equal(loadConfig({ PI_MEMORY_AUTO_LLM_MAX_TOKENS: "100" }).llmMaxTokens, 1024);
 });
 
 test("loadConfig env overrides", () => {

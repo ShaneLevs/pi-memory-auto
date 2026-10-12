@@ -30,5 +30,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): MemoryConfig {
 		renderBudget: 1000,
 		consolidateThreshold: 1000,
 		pageSize: 10,
+		/** maxTokens for background LLM calls; large enough that extraction
+		 *  responses are never truncated (stopReason "length" is rejected). */
+		llmMaxTokens: envInt(env, "PI_MEMORY_AUTO_LLM_MAX_TOKENS", 10_000, 1024, 200_000),
 	};
 }

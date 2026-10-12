@@ -88,6 +88,8 @@ export interface ExtractorDeps {
 	projectRoot: string;
 	mutex: FileMutex;
 	plock: ProcessLock;
+	/** maxTokens for the review LLM call. */
+	llmMaxTokens: number;
 }
 
 /**
@@ -110,7 +112,7 @@ export async function runReview(
 		{
 			systemPrompt: REVIEW_SYSTEM_PROMPT,
 			userPrompt: buildReviewUserPrompt(transcript),
-			maxTokens: 2048,
+			maxTokens: deps.llmMaxTokens,
 			...(timeoutMs !== undefined ? { timeoutMs } : {}),
 		},
 	);

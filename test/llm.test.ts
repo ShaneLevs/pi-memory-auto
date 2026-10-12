@@ -59,6 +59,16 @@ test("stopReason error / aborted -> failure", async () => {
 	assert.equal(r2.ok, false);
 });
 
+test("stopReason length (maxTokens truncation) -> failure, partial text rejected", async () => {
+	const r = await completeWithSessionModel(
+		model,
+		registryWith({ stopReason: "length", content: [{ type: "text", text: "partial entry text that was cut off mid-sen" }] }),
+		{ userPrompt: "x" },
+	);
+	assert.equal(r.ok, false);
+	assert.equal(r.error, "response truncated (maxTokens)");
+});
+
 test("empty text -> failure", async () => {
 	const r = await completeWithSessionModel(model, registryWith({ stopReason: "stop", content: [{ type: "thinking", text: "only thinking" }] }), { userPrompt: "x" });
 	assert.equal(r.ok, false);

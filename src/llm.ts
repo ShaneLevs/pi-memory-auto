@@ -88,6 +88,11 @@ export async function completeWithSessionModel(
 		if (response.stopReason === "error") {
 			return { ok: false, text: "", error: response.errorMessage || "provider error" };
 		}
+		// A maxTokens-truncated response can cut an entry mid-sentence; storing the
+		// partial text would persist a truncated memory. Reject instead.
+		if (response.stopReason === "length") {
+			return { ok: false, text: "", error: "response truncated (maxTokens)" };
+		}
 
 		const text = extractText(response);
 		if (!text) {

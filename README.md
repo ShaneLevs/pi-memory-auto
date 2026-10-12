@@ -2,6 +2,14 @@
 
 Memory system extension for the [pi coding agent](https://github.com/earendil-works/pi).
 
+## Changelog
+
+### 0.2.0
+
+- Fix: truncated memories could be stored when background LLM responses hit the maxTokens cap (stopReason `length` is now rejected instead of persisting partial text)
+- Render overflow (main file exceeds the injection budget) now schedules a background consolidation to prune stale content at the source
+- Background LLM maxTokens raised to 10000, configurable via `PI_MEMORY_AUTO_LLM_MAX_TOKENS`
+
 ## Features
 
 - **Two-layer memory**: global (`~/.pi/agent/memory-auto/`) + per-project (`<project>/.pi/agent/memory-auto/`), plain markdown, git-friendly
@@ -23,6 +31,7 @@ Copy/symlink this directory into `~/.pi/agent/extensions/pi-memory-auto/` (or `<
 |---|---|---|
 | `PI_MEMORY_AUTO_REVIEW_TURNS` | `10` | Conversation turns between automatic extraction reviews |
 | `PI_MEMORY_AUTO_DIR` | `~/.pi/agent/memory-auto` | Global memory directory |
+| `PI_MEMORY_AUTO_LLM_MAX_TOKENS` | `10000` | maxTokens for background LLM calls (extraction / handoff / consolidation) |
 
 ## How it works
 

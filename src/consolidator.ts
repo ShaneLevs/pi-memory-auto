@@ -41,6 +41,8 @@ export interface ConsolidatorDeps {
 	globalDir: string;
 	projectRoot: string;
 	mutex: FileMutex;
+	/** maxTokens for the consolidation LLM call. */
+	llmMaxTokens: number;
 }
 
 export class Consolidator {
@@ -80,7 +82,7 @@ export class Consolidator {
 					{
 						systemPrompt: CONSOLIDATION_SYSTEM_PROMPT,
 						userPrompt: `<current-main-file>\n${raw}\n</current-main-file>\n\n<recent-category-entries>\n${recentEntries}\n</recent-category-entries>`,
-						maxTokens: 4096,
+						maxTokens: this.deps.llmMaxTokens,
 					},
 				);
 				if (!result.ok) return; // keep original; render-time trim is the fallback

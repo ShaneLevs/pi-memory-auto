@@ -1,6 +1,6 @@
 {
   "name": "@shanelevs/pi-memory-auto",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "🧠 Memory extension for the pi coding agent — two-layer markdown memory (global + project), cache-safe snapshot injection, keyword/tag/recent search, turn-based auto-extraction, auto-consolidation. Zero heavy deps.",
   "type": "module",
   "main": "index.ts",

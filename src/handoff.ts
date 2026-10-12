@@ -30,6 +30,8 @@ export interface HandoffDeps {
 	projectRoot: string;
 	mutex: FileMutex;
 	plock: ProcessLock;
+	/** maxTokens for the handoff LLM call. */
+	llmMaxTokens: number;
 }
 
 /** Run the handoff extraction. Never throws; returns written entries. */
@@ -46,7 +48,7 @@ export async function runHandoff(
 	const result = await completeWithSessionModel(
 		model as Parameters<typeof completeWithSessionModel>[0],
 		registry as Parameters<typeof completeWithSessionModel>[1],
-		{ systemPrompt: HANDOFF_SYSTEM_PROMPT, userPrompt: `<conversation>\n${transcript.slice(-30_000)}\n</conversation>`, maxTokens: 2048 },
+		{ systemPrompt: HANDOFF_SYSTEM_PROMPT, userPrompt: `<conversation>\n${transcript.slice(-30_000)}\n</conversation>`, maxTokens: deps.llmMaxTokens },
 	);
 	if (!result.ok) return written;
 

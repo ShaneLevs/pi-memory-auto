@@ -33,7 +33,7 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 	let projectRoot = process.cwd();
 	let projectName = path.basename(projectRoot);
 	let reviewInFlight = false;
-	const consolidator = new Consolidator({ globalDir: config.globalDir, projectRoot, mutex });
+	const consolidator = new Consolidator({ globalDir: config.globalDir, projectRoot, mutex, llmMaxTokens: config.llmMaxTokens });
 
 	/** Count conversation turns from the session branch (stateless).
 	 *  Turn = one user + one assistant message exchange. Compaction entries are
@@ -70,7 +70,7 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 		if (transcript.trim().length === 0) return;
 
 		reviewInFlight = true;
-		void runReview({ globalDir: config.globalDir, projectRoot, mutex, plock: new ProcessLock(config.globalDir) }, transcript, model, registry, timeoutMs)
+		void runReview({ globalDir: config.globalDir, projectRoot, mutex, plock: new ProcessLock(config.globalDir), llmMaxTokens: config.llmMaxTokens }, transcript, model, registry, timeoutMs)
 			.then((written) => {
 				if (written.length > 0 && ctx.hasUI) ctx.ui.notify(`memory-auto: saved ${written.length} memory entries`, "info");
 			})
@@ -78,6 +78,12 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 			.finally(() => {
 				reviewInFlight = false;
 			});
+	}
+
+	/** Schedule a consolidation for a layer if not already pending/in-flight. */
+	function scheduleConsolidation(ctx: ExtensionContext, layer: Layer): void {
+		const { model, registry } = modelInfo(ctx);
+		if (model && registry) consolidator.schedule(layer, model, registry, (k, fn, ms) => debouncer.schedule(k, fn, ms));
 	}
 
 	// Session model access helper (model may be undefined early).
@@ -159,7 +165,7 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 			const cleanedLen = await mainCleanLength(layer, config.globalDir, projectRoot);
 			if (cleanedLen >= config.consolidateThreshold) {
 				const { model, registry } = modelInfo(ctxRef!);
-				if (model && registry) consolidator.schedule(layer, model, registry, (k, fn, ms) => debouncer.schedule(k, fn, ms));
+				if (model && registry) scheduleConsolidation(ctxRef!, layer);
 			}
 			return {
 				content: [{ type: "text" as const, text: `Saved to ${layer}/${params.file}.md [${entry.id}] ${entry.time} tags: ${entry.tags.join(",") || "-"}` }],
@@ -182,12 +188,15 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 	pi.on("before_agent_start", async (event, ctx) => {
 		ctxRef = ctx;
 		try {
-			const injected = await snapshots.getInjection({
+			const { text: injected, overflowedLayers } = await snapshots.getInjection({
 				globalDir: config.globalDir,
 				projectRoot,
 				preamble: INJECTION_PREAMBLE,
 				budget: config.renderBudget,
 			});
+			// Render overflow means tail entries were dropped at injection time;
+			// schedule a consolidation so stale content is pruned at the source.
+			for (const layer of overflowedLayers) scheduleConsolidation(ctx, layer);
 			if (injected && injected.length > 0) {
 				return { systemPrompt: event.systemPrompt + "\n\n" + injected };
 			}
@@ -224,7 +233,7 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 				messages.push({ role: m.role, text });
 			}
 			const transcript = transcriptFromMessages(messages);
-			void runHandoff({ globalDir: config.globalDir, projectRoot, mutex, plock: new ProcessLock(config.globalDir) }, transcript, model, registry).catch(
+			void runHandoff({ globalDir: config.globalDir, projectRoot, mutex, plock: new ProcessLock(config.globalDir), llmMaxTokens: config.llmMaxTokens }, transcript, model, registry).catch(
 				() => undefined,
 			);
 		}
