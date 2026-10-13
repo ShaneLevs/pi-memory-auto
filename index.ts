@@ -14,9 +14,9 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { loadConfig } from "./src/config.ts";
-import { INJECTION_PREAMBLE, MAIN_FILE, PROJECT_CATEGORY_FILES, GLOBAL_CATEGORY_FILES, WRITABLE_FILES, CLASSIFICATION_RUBRIC, LLM_TIMEOUT_MS } from "./src/constants.ts";
+import { CLASSIFICATION_RUBRIC, EXISTING_MEMORIES_MAX_CHARS, INJECTION_PREAMBLE, MAIN_FILE, PROJECT_CATEGORY_FILES, GLOBAL_CATEGORY_FILES, WRITABLE_FILES, HANDOFF_TRANSCRIPT_MAX_CHARS, LLM_TIMEOUT_MS } from "./src/constants.ts";
 import { Consolidator } from "./src/consolidator.ts";
-import { isTrivialSession, runReview, transcriptFromMessages } from "./src/extractor.ts";
+import { isTrivialSession, runReview, serializeTranscript } from "./src/extractor.ts";
 import { runHandoff } from "./src/handoff.ts";
 import { formatSearchResult, loadAllEntries, searchEntries } from "./src/search.ts";
 import { SnapshotManager } from "./src/snapshot.ts";
@@ -43,20 +43,23 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 		return countTurnsFromBranch(ctx.sessionManager.getBranch() as never);
 	}
 
-	/** Extract user/assistant text messages from a branch tail. */
-	function transcriptFromBranch(ctx: ExtensionContext, tail: number): { role: string; text: string }[] {
-		const messages: { role: string; text: string }[] = [];
-		for (const e of ctx.sessionManager.getBranch().slice(-tail)) {
-			if (e.type !== "message") continue;
-			const m = e.message as { role?: string; content?: unknown };
-			if (!m?.role || (m.role !== "user" && m.role !== "assistant")) continue;
-			const content = m.content;
-			const text = Array.isArray(content)
-				? content.filter((c): c is { type: "text"; text: string } => (c as { type?: string }).type === "text").map((c) => c.text).join("\n")
-				: typeof content === "string" ? content : "";
-			messages.push({ role: m.role, text });
+	/** Build the existing-memories digest (recent entries, for review dedup). */
+	async function existingMemoriesDigest(): Promise<string> {
+		const all = await loadAllEntries(config.globalDir, projectRoot);
+		// Newest first, drop empty text, cap to a fixed char budget.
+		const lines: string[] = [];
+		let total = 0;
+		const sorted = all.sort((a, b) => (a.entry.time < b.entry.time ? 1 : -1));
+		for (const { entry, file } of sorted) {
+			const text = entry.text.trim();
+			if (!text) continue;
+			const tags = entry.tags.length > 0 ? ` #${entry.tags.join(" #")}` : "";
+			const line = `- [${file}]${tags} ${text}`;
+			if (total + line.length > EXISTING_MEMORIES_MAX_CHARS) break;
+			lines.push(line);
+			total += line.length;
 		}
-		return messages;
+		return lines.join("\n");
 	}
 
 	/** Run one background extraction review. Fire-and-forget, never blocks. */
@@ -64,13 +67,22 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 		if (reviewInFlight) return;
 		const { model, registry } = modelInfo(ctx);
 		if (!model || !registry) return;
-		const messages = transcriptFromBranch(ctx, 40);
-		if (isTrivialSession(messages.length)) return;
-		const transcript = transcriptFromMessages(messages);
+		const branch = ctx.sessionManager.getBranch().filter((e) => (e as { type?: string }).type === "message").map((e) => (e as { message?: unknown }).message);
+		if (isTrivialSession(branch.length)) return;
+		const transcript = serializeTranscript(branch);
 		if (transcript.trim().length === 0) return;
 
 		reviewInFlight = true;
-		void runReview({ globalDir: config.globalDir, projectRoot, mutex, plock: new ProcessLock(config.globalDir), llmMaxTokens: config.llmMaxTokens }, transcript, model, registry, timeoutMs)
+		void existingMemoriesDigest()
+			.then((existingMemories) =>
+				runReview(
+					{ globalDir: config.globalDir, projectRoot, mutex, plock: new ProcessLock(config.globalDir), llmMaxTokens: config.llmMaxTokens },
+					transcript,
+					model,
+					registry,
+					timeoutMs,
+					existingMemories,
+				))
 			.then((written) => {
 				if (written.length > 0 && ctx.hasUI) ctx.ui.notify(`memory-auto: saved ${written.length} memory entries`, "info");
 			})
@@ -222,17 +234,9 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 		// Fire-and-forget handoff so important state survives compaction.
 		const { model, registry } = modelInfo(ctx);
 		if (model && registry) {
-			const messages: { role: string; text: string }[] = [];
-			for (const e of [...event.preparation.messagesToSummarize].slice(-30)) {
-				const m = e as unknown as { role?: string; content?: unknown };
-				if (!m?.role || (m.role !== "user" && m.role !== "assistant")) continue;
-				const content = m.content;
-				const text = Array.isArray(content)
-					? content.filter((c): c is { type: "text"; text: string } => (c as { type?: string }).type === "text").map((c) => c.text).join("\n")
-					: typeof content === "string" ? content : "";
-				messages.push({ role: m.role, text });
-			}
-			const transcript = transcriptFromMessages(messages);
+			// pi's compaction path exposes convertToLlm-able AgentMessages; use the
+			// full serialized view (tool calls + truncated tool results included).
+			const transcript = serializeTranscript([...event.preparation.messagesToSummarize].slice(-HANDOFF_TRANSCRIPT_MAX_CHARS));
 			void runHandoff({ globalDir: config.globalDir, projectRoot, mutex, plock: new ProcessLock(config.globalDir), llmMaxTokens: config.llmMaxTokens }, transcript, model, registry).catch(
 				() => undefined,
 			);

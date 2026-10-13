@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { loadConfig } from "../src/config.ts";
-import { isTrivialSession, parseReviewResponse, REVIEW_SYSTEM_PROMPT, transcriptFromMessages } from "../src/extractor.ts";
+import {
+	buildReviewUserPrompt,
+	isTrivialSession,
+	parseReviewResponse,
+	REVIEW_SYSTEM_PROMPT,
+	serializeTranscript,
+} from "../src/extractor.ts";
 import { CLASSIFICATION_RUBRIC, INJECTION_PREAMBLE } from "../src/constants.ts";
 
 test("loadConfig defaults", () => {
@@ -78,12 +84,59 @@ test("trivial session gate", () => {
 });
 
 test("transcript capped and roles labeled", () => {
-	const t = transcriptFromMessages([
-		{ role: "user", text: "hello" },
-		{ role: "assistant", text: "hi" },
-		{ role: "assistant", text: "" },
+	const t = serializeTranscript([
+		{ type: "message", message: { role: "user", content: [{ type: "text", text: "hello" }], timestamp: 1 } },
+		{ type: "message", message: { role: "assistant", content: [{ type: "text", text: "hi" }], timestamp: 2 } },
 	]);
-	assert.match(t, /^user: hello\n\nassistant: hi$/);
+	assert.match(t, /\[User\]: hello/);
+	assert.match(t, /\[Assistant\]: hi/);
+});
+
+test("serializeTranscript: includes tool calls and results, caps length", () => {
+	const messages = [
+		{ type: "message", message: { role: "user", content: [{ type: "text", text: "fix the test" }], timestamp: 1 } },
+		{
+			type: "message",
+			message: {
+				role: "assistant",
+				content: [
+					{ type: "text", text: "running tests" },
+					{ type: "toolCall", id: "t1", name: "bash", arguments: { command: "bun test" } },
+				],
+				timestamp: 2,
+			},
+		},
+		{
+			type: "message",
+			message: {
+				role: "toolResult",
+				toolCallId: "t1",
+				toolName: "bash",
+				content: [{ type: "text", text: "1 failed, 3 passed" }],
+				isError: true,
+				timestamp: 3,
+			},
+		},
+	];
+	const t = serializeTranscript(messages);
+	assert.ok(t.includes("[User]"));
+	assert.ok(t.includes("[Assistant]"));
+	assert.ok(t.includes("bash(command="));
+	assert.ok(t.includes("[Tool result]"));
+	// Truncation keeps the tail (most recent context).
+	const long = serializeTranscript([
+		{ type: "message", message: { role: "user", content: [{ type: "text", text: "x".repeat(70_000) }], timestamp: 1 } },
+	]);
+	assert.ok(long.length <= 60_000);
+});
+
+test("buildReviewUserPrompt: existing memories section", () => {
+	const p = buildReviewUserPrompt("transcript body", "- [global/USER.md] prefers bun");
+	assert.ok(p.includes("Existing memories"));
+	assert.ok(p.includes("prefers bun"));
+	assert.ok(p.includes("transcript body"));
+	const empty = buildReviewUserPrompt("t", "");
+	assert.ok(empty.includes("(empty"));
 });
 
 test("rubric and preamble are English and non-empty", () => {
@@ -91,4 +144,9 @@ test("rubric and preamble are English and non-empty", () => {
 	assert.ok(CLASSIFICATION_RUBRIC.includes("would a future session"));
 	assert.ok(INJECTION_PREAMBLE.includes("memory_search"));
 	assert.ok(REVIEW_SYSTEM_PROMPT.includes("NOTHING_TO_SAVE"));
+	// Anti-hallucination guard: process lines are evidence, never invent details.
+	assert.ok(REVIEW_SYSTEM_PROMPT.includes("[Assistant tool calls]"));
+	assert.ok(REVIEW_SYSTEM_PROMPT.includes("never invent"));
+	// Existing memories are for dedup.
+	assert.ok(REVIEW_SYSTEM_PROMPT.includes("Existing memories"));
 });

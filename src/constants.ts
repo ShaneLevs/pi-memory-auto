@@ -38,9 +38,17 @@ export const WRITE_DEBOUNCE_MS = 5000;
 
 /** Self-timeout (ms) for background LLM calls (review/consolidation). */
 export const LLM_TIMEOUT_MS = 120_000;
-
 /** Sessions with fewer valid messages than this are skipped by auto-extraction. */
 export const MIN_MESSAGES_FOR_REVIEW = 4;
+
+/** Cap (chars) for the serialized review/handoff transcript. */
+export const TRANSCRIPT_MAX_CHARS = 60_000;
+
+/** Cap (chars) for the existing-memories section in the review prompt. */
+export const EXISTING_MEMORIES_MAX_CHARS = 4_000;
+
+/** Cap (chars) for the serialized handoff transcript. */
+export const HANDOFF_TRANSCRIPT_MAX_CHARS = 60_000;
 
 // ── Entry format ────────────────────────────────────────────────────────────
 

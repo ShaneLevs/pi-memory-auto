@@ -4,6 +4,12 @@ Memory system extension for the [pi coding agent](https://github.com/earendil-wo
 
 ## Changelog
 
+### 0.3.0
+
+- Review/handoff transcripts now use pi's own `serializeConversation` (the compaction path): the extraction LLM sees `[Assistant tool calls]` and `[Tool result]` lines (tool results truncated to 2000 chars by pi), not just user/assistant prose — so failure lessons and tool quirks recorded in tool output are no longer invisible
+- Review prompt now includes an "Existing memories" digest (newest entries, capped) for dedup, mirroring pi-hermes-memory's approach; the system prompt gains an anti-hallucination guard (process lines are evidence, never invent details)
+- Transcript capped at 60k chars (`TRANSCRIPT_MAX_CHARS`), keeping the most recent tail
+
 ### 0.2.0
 
 - Fix: truncated memories could be stored when background LLM responses hit the maxTokens cap (stopReason `length` is now rejected instead of persisting partial text)
@@ -18,7 +24,7 @@ Memory system extension for the [pi coding agent](https://github.com/earendil-wo
 - **Snapshot injection**: rendered main memories (≤1000 chars each) injected only on session start and after compaction — byte-stable in between to preserve prompt prefix cache
 - **Search-only access**: the agent never reads whole files; `memory_search` supports `keyword` / `tag` / `recent` / `all` modes with pagination
 - **Guarded writes**: `memory_write` appends to category files only; the main file is maintained exclusively by the background consolidator (triggered when cleaned content ≥1000 chars, uses the session model, keeps a `.bak`)
-- **Turn-based auto-extraction**: every N turns (default 10, `PI_MEMORY_AUTO_REVIEW_TURNS`) a background review extracts durable memories into category files; conservative by default ("nothing to save" is valid)
+- **Turn-based auto-extraction**: every N turns (default 10, `PI_MEMORY_AUTO_REVIEW_TURNS`) a background review extracts durable memories into category files; conservative by default ("nothing to save" is valid). The review sees the full serialized conversation (including tool calls and tool results) plus existing memories for dedup
 - **Compaction handoff**: before context compaction, a handoff entry is appended so important state survives
 
 ## Install

@@ -9,7 +9,8 @@
  * - Uses the session model; runs asynchronously; never blocks the conversation.
  */
 
-import { CLASSIFICATION_RUBRIC, MIN_MESSAGES_FOR_REVIEW } from "./constants.ts";
+import { CLASSIFICATION_RUBRIC, MIN_MESSAGES_FOR_REVIEW, TRANSCRIPT_MAX_CHARS } from "./constants.ts";
+import { convertToLlm, serializeConversation } from "@earendil-works/pi-coding-agent";
 import { completeWithSessionModel } from "./llm.ts";
 import { appendEntry, isWritableTarget, type FileMutex, type ProcessLock } from "./store.ts";
 import type { Layer, MemoryEntry, WriteTarget } from "./types.ts";
@@ -17,6 +18,16 @@ import type { Layer, MemoryEntry, WriteTarget } from "./types.ts";
 export const REVIEW_SYSTEM_PROMPT = `You review coding conversations and extract durable memories worth saving for future sessions.
 
 ${CLASSIFICATION_RUBRIC}
+
+The transcript below is a serialized conversation, not a live chat. Lines starting with
+"[Assistant tool calls]:" and "[Tool result]:" record what the agent actually did and what
+its tools returned. Use them as evidence for failures, corrections, and tool quirks —
+but never invent process details that are not recorded, and never save a "lesson" unless
+the transcript itself supports it.
+
+The "Existing memories" section lists what is already stored. Its only purpose is dedup:
+skip a candidate when an equivalent entry exists; refine an existing one only when the
+transcript clearly adds something material.
 
 Output format — respond with entries, one block per memory, nothing else:
 
@@ -32,16 +43,18 @@ Rules:
 - If nothing is worth saving, respond with exactly: NOTHING_TO_SAVE
 - Do not store secrets, API keys, or tokens.`;
 
-/** Serialized recent conversation (simple text transcript). */
-export function buildReviewUserPrompt(transcript: string): string {
-	return `Review the following recent conversation and extract durable memories (if any).
-
-<conversation>
-${transcript}
-</conversation>
-
-Remember: at most 3 entries, follow the classification guide, or respond NOTHING_TO_SAVE.`;
-
+/** Serialized recent conversation. */
+export function buildReviewUserPrompt(transcript: string, existingMemories: string): string {
+	const sections = [
+		"--- Existing memories (for dedup only) ---",
+		existingMemories.trim() || "(empty — nothing stored yet)",
+		"",
+		"--- Conversation to review ---",
+		`<conversation>\n${transcript}\n</conversation>`,
+		"",
+		"Remember: at most 3 entries, follow the classification guide, or respond NOTHING_TO_SAVE.",
+	];
+	return sections.join("\n");
 }
 
 /** Parse the ===ENTRY=== blocks from a review response. */
@@ -74,13 +87,25 @@ export function parseReviewResponse(
 	return out;
 }
 
-/** Convert session messages to a compact transcript for review. */
-export function transcriptFromMessages(messages: { role: string; text: string }[]): string {
-	return messages
-		.filter((m) => m.text.trim().length > 0)
-		.map((m) => `${m.role}: ${m.text.trim()}`)
-		.join("\n\n")
-		.slice(-30_000); // cap transcript size
+/**
+ * Serialize agent messages into the review transcript.
+ *
+ * Uses pi's own serializeConversation (the compaction path), which keeps
+ * [Assistant tool calls] and [Tool result] lines (tool results truncated to
+ * 2000 chars by pi) so the extraction LLM can see the agent's working process,
+ * not just its final prose. Thinking blocks are omitted (same rationale as
+ * compaction: replayed thinking is unreliable and bloats the request).
+ *
+ * Accepts AgentMessage[] (role-bearing objects) or session entries
+ * ({ type: "message", message }) — entries are unwrapped first.
+ */
+export function serializeTranscript(messages: unknown[]): string {
+	const agentMessages = messages.map((m) => {
+		const e = m as { type?: string; message?: unknown };
+		return e?.type === "message" && e.message && typeof e.message === "object" ? e.message : m;
+	}).filter((m) => m && typeof m === "object" && typeof (m as { role?: unknown }).role === "string");
+	const text = serializeConversation(convertToLlm(agentMessages as never[]));
+	return text.length > TRANSCRIPT_MAX_CHARS ? text.slice(-TRANSCRIPT_MAX_CHARS) : text;
 }
 
 export interface ExtractorDeps {
@@ -102,6 +127,7 @@ export async function runReview(
 	model: unknown,
 	registry: unknown,
 	timeoutMs?: number,
+	existingMemories = "",
 ): Promise<MemoryEntry[]> {
 	const written: MemoryEntry[] = [];
 	if (transcript.trim().length === 0) return written;
@@ -111,7 +137,7 @@ export async function runReview(
 		registry as Parameters<typeof completeWithSessionModel>[1],
 		{
 			systemPrompt: REVIEW_SYSTEM_PROMPT,
-			userPrompt: buildReviewUserPrompt(transcript),
+			userPrompt: buildReviewUserPrompt(transcript, existingMemories),
 			maxTokens: deps.llmMaxTokens,
 			...(timeoutMs !== undefined ? { timeoutMs } : {}),
 		},

@@ -4,7 +4,7 @@
  * Runs asynchronously and never blocks compaction.
  */
 
-import { CLASSIFICATION_RUBRIC } from "./constants.ts";
+import { CLASSIFICATION_RUBRIC, HANDOFF_TRANSCRIPT_MAX_CHARS } from "./constants.ts";
 import { completeWithSessionModel } from "./llm.ts";
 import { appendEntry, type FileMutex, type ProcessLock } from "./store.ts";
 import type { MemoryEntry } from "./types.ts";
@@ -48,7 +48,7 @@ export async function runHandoff(
 	const result = await completeWithSessionModel(
 		model as Parameters<typeof completeWithSessionModel>[0],
 		registry as Parameters<typeof completeWithSessionModel>[1],
-		{ systemPrompt: HANDOFF_SYSTEM_PROMPT, userPrompt: `<conversation>\n${transcript.slice(-30_000)}\n</conversation>`, maxTokens: deps.llmMaxTokens },
+		{ systemPrompt: HANDOFF_SYSTEM_PROMPT, userPrompt: `<conversation>\n${transcript.slice(-HANDOFF_TRANSCRIPT_MAX_CHARS)}\n</conversation>`, maxTokens: deps.llmMaxTokens },
 	);
 	if (!result.ok) return written;
 
