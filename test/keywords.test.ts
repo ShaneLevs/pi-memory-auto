@@ -67,11 +67,21 @@ test("per-layer cap is 200 keywords", () => {
 
 test("splitTagCandidates splits legacy '#'-prefixed blobs but keeps multi-word keywords", () => {
 	assert.deepEqual(splitTagCandidates("#ui-taste #design-feedback #screenshots"), ["ui-taste", "design-feedback", "screenshots"]);
+	// A '#' glued into the middle is a separator too: a model answering
+	// "TAGS: memory-write #tool-quirk" used to store one unsearchable keyword.
+	assert.deepEqual(splitTagCandidates("memory-write-#tool-quirk"), ["memory-write", "tool-quirk"]);
 	// A genuine multi-word keyword (allowed by the 8-word rule) survives whole.
 	assert.deepEqual(splitTagCandidates("Serialize Conversation"), ["Serialize Conversation"]);
 	// Commas are always separators.
 	assert.deepEqual(splitTagCandidates("deploy, rsync"), ["deploy", "rsync"]);
 	assert.deepEqual(splitTagCandidates("  "), []);
+});
+
+test("sanitizeKeywords never stores a '#' glue blob", () => {
+	assert.deepEqual(sanitizeKeywords(["memory-write-#tool-quirk"]), { keywords: ["memory-write", "tool-quirk"], issues: [] });
+	assert.deepEqual(sanitizeKeywords(["#a #b"]).keywords, ["a", "b"]);
+	// A '#' inside a keyword is still rejected when it reaches validation directly.
+	assert.match(keywordIssue("memory-write-#tool-quirk") ?? "", /contains '#'/);
 });
 
 test("coerceKeywords repairs dirty tags in the read path", () => {

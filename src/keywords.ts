@@ -56,6 +56,9 @@ export function keywordDisplay(raw: string): string {
 export function keywordIssue(raw: string): string | null {
 	const text = raw.trim().replace(/^#+/, "");
 	if (!text) return "keyword is empty";
+	// A '#' is a list separator, never part of a keyword. Letting one through
+	// creates a blob like "memory-write-#tool-quirk" that no lookup can match.
+	if (text.includes("#")) return "contains '#' inside the keyword (use one keyword per value)";
 	if (/\s/.test(text)) {
 		const words = text.split(/\s+/).filter(Boolean).length;
 		if (words > MAX_LATIN_WORDS) return `${words} words (max ${MAX_LATIN_WORDS})`;
@@ -77,13 +80,19 @@ export interface SanitizeResult {
 
 /**
  * Normalize, validate and cap a keyword list.
+ *
+ * Each candidate is split first (see splitTagCandidates): a model that answers
+ * `TAGS: memory-write #tool-quirk` or `a, b` must yield two keywords, never one
+ * blob. Each surviving keyword is validated, deduped by canonical key and the
+ * list is capped at MAX_KEYWORDS.
+ *
  * Never throws; the caller decides whether an empty result is fatal.
  */
 export function sanitizeKeywords(raw: readonly string[]): SanitizeResult {
 	const keywords: string[] = [];
 	const issues: string[] = [];
 	const seen = new Set<string>();
-	for (const candidate of raw) {
+	for (const candidate of raw.flatMap((t) => splitTagCandidates(t))) {
 		const display = keywordDisplay(candidate);
 		const key = keywordKey(candidate);
 		if (!key) {
@@ -109,24 +118,28 @@ export function sanitizeKeywords(raw: readonly string[]): SanitizeResult {
 /**
  * Split a raw tag field into candidate keywords.
  *
- * Commas are always separators. Whitespace only is a separator when the field
- * is legacy `#`-prefixed data — the pre-0.5 extractor stored
- * `#ui-taste #design-feedback #screenshots` as ONE tag, which used to reach the
- * index as the single unsearchable blob `#ui-taste-#design-feedback-#screenshots`.
+ * A `#` anywhere is a list separator, never part of a keyword — that is how the
+ * pre-0.5 extractor stored `#ui-taste #design-feedback #screenshots` as ONE tag
+ * (which reached the index as the unsearchable blob
+ * `#ui-taste-#design-feedback-#screenshots`), and how a model answering
+ * `TAGS: memory-write #tool-quirk` used to store one glued keyword. Commas are
+ * separators too.
+ *
  * A genuine multi-word keyword (`Serialize Conversation`, allowed up to 8 words)
- * has no `#` and is kept whole.
+ * contains no `#` and is kept whole.
  */
 export function splitTagCandidates(raw: string): string[] {
-	return raw
+	const trimmed = raw.trim();
+	if (!trimmed) return [];
+	if (trimmed.includes("#")) {
+		return trimmed
+			.split(/[#,\s]+/)
+			.map((t) => t.replace(/^[-_]+|[-_]+$/g, ""))
+			.filter(Boolean);
+	}
+	return trimmed
 		.split(",")
-		.flatMap((part) => {
-			const trimmed = part.trim();
-			if (!trimmed) return [];
-			const words = trimmed.split(/\s+/);
-			const hashed = words.some((w) => w.startsWith("#"));
-			return hashed && words.length > 1 ? words : [trimmed];
-		})
-		.map((t) => t.trim().replace(/^#+/, ""))
+		.map((t) => t.trim())
 		.filter(Boolean);
 }
 
