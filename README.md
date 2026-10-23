@@ -6,6 +6,10 @@ Every memory is stored as **a body plus 1–3 keywords**. The keywords go into a
 
 ## Changelog
 
+### 0.6.0
+
+- New `/memory` command: `show` (keyword index + watermark), `compact` (merge duplicates now, regardless of the threshold), `rebuild` (regenerate `MEMORY.md`). Argument completion included.
+
 ### 0.5.0
 
 - **Keyword contract enforced.** Every memory carries 1–3 keywords; each is at most 8 Chinese characters or 8 english words. `memory_write` rejects a write with an actionable error instead of storing an unusable keyword; the background extractor derives a keyword when the model omits one, so no memory is ever keyword-less.
@@ -61,6 +65,14 @@ pi install npm:@shanelevs/pi-memory-auto
 | `PI_MEMORY_AUTO_DIR` | `~/.pi/agent/memory-auto` | Global memory directory |
 | `PI_MEMORY_AUTO_INDEX_BUDGET` | `3000` | Characters per layer for the injected keyword table |
 | `PI_MEMORY_AUTO_LLM_MAX_TOKENS` | `10000` | maxTokens for background LLM calls (extraction / handoff / consolidation) |
+
+## Commands
+
+| Command | Effect |
+|---|---|
+| `/memory` or `/memory show` | Print both layers' keyword tables, memory/keyword counts, the `sinceLast` watermark, the consolidation marker, and the file paths. The report is added to the transcript as a custom message (so the agent sees the current index too). |
+| `/memory compact` | Run a consolidation round immediately — merge duplicate memories and reconcile keywords — then reset the watermark. Needs a session model; failure leaves the store untouched. |
+| `/memory rebuild` | Regenerate `MEMORY.md` from the category files (recovers from hand edits or a format migration) and report how many memories/keywords each layer now has. |
 
 ## How it works
 

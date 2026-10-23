@@ -24,6 +24,7 @@ import { isTrivialSession, runReview, serializeTranscript } from "./src/extracto
 import { runHandoff } from "./src/handoff.ts";
 import { materializeAll, type LayerStats } from "./src/indexer.ts";
 import { MAX_KEYWORDS, MAX_KEYWORDS_PER_LAYER, sanitizeKeywords } from "./src/keywords.ts";
+import { buildMemoryReport } from "./src/report.ts";
 import { formatSearchResult, loadAllEntries, searchEntries } from "./src/search.ts";
 import { SnapshotManager } from "./src/snapshot.ts";
 import { Debouncer, FileMutex, ProcessLock, appendEntry, isWritableTarget } from "./src/store.ts";
@@ -230,6 +231,94 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 				content: [{ type: "text" as const, text: `Saved to ${layer}/${params.file}.md [${entry.id}] ${entry.time} keywords: ${entry.tags.join(",")}` }],
 				details: { summary: `saved ${layer}/${params.file}.md`, entryId: entry.id } as { summary: string; entryId?: string },
 			};
+		},
+	});
+
+	// ── Commands ─────────────────────────────────────────────────────────────
+
+	/** Re-read the project root: a command can run after the session moved. */
+	function syncProject(ctx: ExtensionContext): void {
+		projectRoot = ctx.cwd;
+		projectName = path.basename(projectRoot);
+	}
+
+	const MEMORY_SUBS = [
+		{ value: "show", label: "show", description: "Print the keyword index and consolidation watermark" },
+		{ value: "compact", label: "compact", description: "Merge duplicate memories now, regardless of the threshold" },
+		{ value: "rebuild", label: "rebuild", description: "Regenerate MEMORY.md from the category files" },
+	];
+
+	pi.registerCommand("memory", {
+		description: "Show the memory keyword index; 'compact' merges duplicates now; 'rebuild' regenerates MEMORY.md",
+		getArgumentCompletions: (prefix) => MEMORY_SUBS.filter((s) => s.value.startsWith(prefix.trim().toLowerCase())),
+		handler: async (args, ctx) => {
+			syncProject(ctx);
+			const sub = (args.trim().split(/\s+/)[0] ?? "").toLowerCase();
+
+			if (sub === "rebuild") {
+				const stats = await materializeAll(indexDeps());
+				const ok = [stats.global, stats.project].some((s) => s.written);
+				ctx.ui.notify(
+					`memory: index ${ok ? "rebuilt" : "already current"} — global ${stats.global.entries}/${stats.global.keywords}, project ${stats.project.entries}/${stats.project.keywords}`,
+					"info",
+				);
+				return;
+			}
+
+			if (sub === "compact") {
+				const { model, registry } = modelInfo(ctx);
+				if (!model || !registry) {
+					ctx.ui.notify("memory: no session model available, cannot consolidate", "error");
+					return;
+				}
+				if (consolidationInFlight) {
+					ctx.ui.notify("memory: a consolidation round is already running", "warning");
+					return;
+				}
+				ctx.ui.notify("memory: consolidating…", "info");
+				consolidationInFlight = true;
+				try {
+					const entries = await loadAllEntries(config.globalDir, projectRoot);
+					const result = await runConsolidation(writeDeps(), entries, model, registry, CONSOLIDATION_TIMEOUT_MS);
+					if (result.noop) {
+						// Nothing merged: keep the watermark, but don't re-run on the next write.
+						const stats = await materializeAll(indexDeps());
+						attemptedAt.global = stats.global.sinceLast;
+						attemptedAt.project = stats.project.sinceLast;
+						ctx.ui.notify(`memory: nothing to merge (${entries.length} memories)`, "info");
+						return;
+					}
+					const stats = await materializeAll(indexDeps(), { resetCounter: true });
+					attemptedAt.global = 0;
+					attemptedAt.project = 0;
+					ctx.ui.notify(
+						`memory: merged ${result.removed} ${result.removed === 1 ? "memory" : "memories"} across ${result.changedFiles} ${result.changedFiles === 1 ? "file" : "files"} — now global ${stats.global.entries}/${stats.global.keywords}, project ${stats.project.entries}/${stats.project.keywords}`,
+						"info",
+					);
+				} catch (error) {
+					ctx.ui.notify(`memory: consolidation failed — ${error instanceof Error ? error.message : String(error)}`, "error");
+				} finally {
+					consolidationInFlight = false;
+				}
+				return;
+			}
+
+			if (sub !== "" && sub !== "show") {
+				ctx.ui.notify(`memory: unknown argument "${sub}" — use show, compact or rebuild`, "warning");
+				return;
+			}
+
+			const stats = await materializeAll(indexDeps());
+			const entries = await loadAllEntries(config.globalDir, projectRoot);
+			const report = buildMemoryReport(entries, {
+				globalDir: config.globalDir,
+				projectRoot,
+				projectName,
+				threshold: config.consolidateEvery,
+				global: stats.global,
+				project: stats.project,
+			});
+			pi.sendMessage({ customType: "memory-auto.report", content: report, display: true });
 		},
 	});
 
