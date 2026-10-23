@@ -6,7 +6,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { ENTRY_META_PREFIX, MAIN_FILE, PROJECT_DIR, WRITABLE_FILES } from "./constants.ts";
-import { generateEntryId, formatTime, parseEntries, serializeEntry } from "./entry.ts";
+import { ENTRY_ID_RE, generateEntryId, formatTime, normalizeMemoryText, parseEntries, serializeEntry, serializeMetaLine } from "./entry.ts";
 import { keywordKey } from "./keywords.ts";
 import type { CategoryFile, Layer, MemoryEntry, MemorySource, WriteTarget } from "./types.ts";
 
@@ -111,17 +111,67 @@ export class ProcessLock {
 	}
 }
 
+/** Result of a write: the stored entry plus whether it was a re-confirmation. */
+export interface AppendOutcome {
+	/** The entry as it now exists on disk (a new row, or the bumped one). */
+	entry: MemoryEntry;
+	/** True when an identical body was already stored: nothing was appended. */
+	deduped: boolean;
+	/** Where the entry lives, e.g. "project/FAILURES.md". */
+	file: string;
+	/** How many stored entries this write marked as superseded. */
+	superseded: number;
+}
+
 /**
- * Append one entry to a category file. Returns the stored entry.
+ * Append one entry to a category file (or fold it into an existing identical one).
+ *
+ * Write-time idempotency: if the same body (after normalizeMemoryText) already
+ * exists anywhere in the same layer, nothing is appended — the stored entry's
+ * `seen`/`last` are bumped instead. The check spans the layer, not just the
+ * target file, because the extractor flip-flops between e.g. LESSONS.md and
+ * FAILURES.md for the same fact; catching that here is cheaper and more
+ * reliable than hoping a later LLM consolidation round notices.
+ *
  * Appends are atomic enough: single-process mutex + cross-process lockfile +
  * append-only writes.
  */
 export async function appendEntry(
 	target: WriteTarget,
 	text: string,
-	opts: { tags?: string[]; source?: MemorySource; globalDir: string; projectRoot: string; mutex: FileMutex; plock: ProcessLock; now?: Date },
-): Promise<MemoryEntry> {
+	opts: {
+		tags?: string[];
+		source?: MemorySource;
+		globalDir: string;
+		projectRoot: string;
+		mutex: FileMutex;
+		plock: ProcessLock;
+		now?: Date;
+		/** Ids of stored entries this one replaces (same layer). */
+		supersedes?: string[];
+	},
+): Promise<AppendOutcome> {
 	const now = opts.now ?? new Date();
+	const body = text.trim();
+	const normalized = normalizeMemoryText(body);
+	const supersedes = [...new Set((opts.supersedes ?? []).filter((id) => ENTRY_ID_RE.test(id)))];
+
+	if (normalized) {
+		for (const candidate of await findLayerEquivalents(target.layer, normalized, opts.globalDir, opts.projectRoot)) {
+			// Re-find inside the lock: a consolidation may have rewritten the file
+			// between the scan and this point, so the id alone is not enough.
+			const bumped = await opts.mutex.run(candidate.filePath, () =>
+				opts.plock.withLock(candidate.filePath, () => bumpEntry(candidate.filePath, normalized, now, supersedes)),
+			);
+			if (bumped) {
+				// A deduped write can still replace older entries ("same text, but the
+				// two entries it was spread across are now dead").
+				const replaced = supersedes.length > 0 ? await markSuperseded(target.layer, supersedes, bumped.id, opts) : { changed: 0 };
+				return { entry: bumped, deduped: true, file: `${target.layer}/${candidate.file}.md`, superseded: replaced.changed };
+			}
+		}
+	}
+
 	const entry: MemoryEntry = {
 		id: generateEntryId(now),
 		time: formatTime(now),
@@ -129,7 +179,8 @@ export async function appendEntry(
 		layer: target.layer,
 		source: opts.source ?? "user",
 		tags: opts.tags ?? [],
-		text: text.trim(),
+		text: body,
+		...(supersedes.length > 0 ? { supersedes } : {}),
 	};
 	const filePath = categoryFilePath(target, opts.globalDir, opts.projectRoot);
 	const key = filePath;
@@ -139,7 +190,113 @@ export async function appendEntry(
 			await fs.appendFile(filePath, serializeEntry(entry), "utf8");
 		}),
 	);
-	return entry;
+	const replaced = supersedes.length > 0 ? await markSuperseded(target.layer, supersedes, entry.id, opts) : { changed: 0 };
+	return { entry, deduped: false, file: `${target.layer}/${target.file}.md`, superseded: replaced.changed };
+}
+
+/**
+ * Mark stored entries as replaced by `byId` — the soft form of deletion.
+ *
+ * The entry keeps its row and its body; only the metadata gains
+ * `superseded-by`. Consequences (all reversible by removing that field):
+ * - its keywords stop contributing to MEMORY.md / the injected index
+ *   (index-map.ts);
+ * - search still finds it but never ranks it above a live memory, and labels it
+ *   with the replacement id (search.ts);
+ * - a later consolidation pass can merge the rows away normally.
+ *
+ * Already-superseded entries are left alone (the first replacement wins), ids
+ * from another layer are ignored, and an unknown id changes nothing.
+ */
+export async function markSuperseded(
+	layer: Layer,
+	ids: readonly string[],
+	byId: string,
+	deps: { globalDir: string; projectRoot: string; mutex: FileMutex; plock: ProcessLock },
+): Promise<{ changed: number }> {
+	const wanted = new Set(ids.filter((id) => id !== byId && ENTRY_ID_RE.test(id)));
+	if (wanted.size === 0) return { changed: 0 };
+
+	let changed = 0;
+	for (const file of WRITABLE_FILES[layer]) {
+		const filePath = categoryFilePath({ layer, file }, deps.globalDir, deps.projectRoot);
+		changed += await deps.mutex.run(filePath, () =>
+			deps.plock.withLock(filePath, async () => {
+				const raw = await readFileOrEmpty(filePath);
+				if (!raw) return 0;
+				const lines = raw.split("\n");
+				let touched = 0;
+				for (const entry of parseEntries(raw)) {
+					if (!wanted.has(entry.id) || entry.supersededBy) continue;
+					const metaRe = new RegExp(`^<!--\\s*mid:\\s*${entry.id}\\s*\\|`);
+					const index = lines.findIndex((line) => metaRe.test(line.trim()));
+					if (index < 0) continue;
+					lines[index] = serializeMetaLine({ ...entry, supersededBy: byId });
+					touched++;
+				}
+				if (touched === 0) return 0;
+				const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}`;
+				await fs.writeFile(tmp, lines.join("\n"), "utf8");
+				await fs.rename(tmp, filePath);
+				return touched;
+			}),
+		);
+	}
+	return { changed };
+}
+
+/** Files of one layer that already hold a LIVE entry with this normalized body. */
+async function findLayerEquivalents(
+	layer: Layer,
+	normalized: string,
+	globalDir: string,
+	projectRoot: string,
+): Promise<{ file: CategoryFile; filePath: string }[]> {
+	const out: { file: CategoryFile; filePath: string }[] = [];
+	for (const file of WRITABLE_FILES[layer]) {
+		const filePath = categoryFilePath({ layer, file }, globalDir, projectRoot);
+		const raw = await readFileOrEmpty(filePath);
+		if (!raw) continue;
+		// A superseded row is not a match: re-asserting its body must revive the
+		// fact as a new, live memory instead of bumping a dead one.
+		if (parseEntries(raw).some((entry) => !entry.supersededBy && normalizeMemoryText(entry.text) === normalized)) {
+			out.push({ file, filePath });
+		}
+	}
+	return out;
+}
+
+/**
+ * Increment `seen`/`last` of the entry holding this body. Returns undefined when
+ * the entry is gone (merged away meanwhile), so the caller falls back to a plain
+ * append.
+ *
+ * Exactly one metadata line is rewritten; the body text on disk is untouched.
+ * Written via temp file + rename so a crash cannot truncate the category file.
+ */
+async function bumpEntry(filePath: string, normalized: string, now: Date, extraSupersedes: readonly string[] = []): Promise<MemoryEntry | undefined> {
+	const raw = await readFileOrEmpty(filePath);
+	if (!raw) return undefined;
+	const existing = parseEntries(raw).find((entry) => !entry.supersededBy && normalizeMemoryText(entry.text) === normalized);
+	if (!existing) return undefined;
+
+	const supersedes = [...new Set([...(existing.supersedes ?? []), ...extraSupersedes])].filter((id) => id !== existing.id);
+	const bumped: MemoryEntry = {
+		...existing,
+		seen: (existing.seen ?? 1) + 1,
+		last: formatTime(now),
+		...(supersedes.length > 0 ? { supersedes } : {}),
+	};
+	const lines = raw.split("\n");
+	const metaRe = new RegExp(`^<!--\\s*mid:\\s*${existing.id}\\s*\\|`);
+	const index = lines.findIndex((line) => metaRe.test(line.trim()));
+	if (index < 0) return undefined;
+	lines[index] = serializeMetaLine(bumped);
+
+	const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}`;
+	await fs.writeFile(tmp, lines.join("\n"), "utf8");
+	await fs.rename(tmp, filePath);
+	return bumped;
 }
 
 /** Validate that a target is writable (a category file, never the main file). */

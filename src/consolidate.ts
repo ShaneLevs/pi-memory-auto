@@ -19,6 +19,7 @@
  */
 
 import { GLOBAL_CATEGORY_FILES, PROJECT_CATEGORY_FILES, LLM_TIMEOUT_MS } from "./constants.ts";
+import { describeCandidate, findDuplicateCandidates, type DuplicateCandidate } from "./duplicates.ts";
 import { sanitizeKeywords } from "./keywords.ts";
 import { completeWithSessionModel } from "./llm.ts";
 import { applyConsolidation, type ApplyDeps, type ConsolidationPlan, type KeywordRename, type MergeOp } from "./store.ts";
@@ -34,6 +35,8 @@ const MAX_ROUNDS = 12;
 const MAX_MERGES = 40;
 /** Max keyword renames accepted from one response. */
 const MAX_RENAMES = 40;
+/** Max near-duplicate pairs attached to one prompt as a hint. */
+const MAX_HINTS = 6;
 
 export const CONSOLIDATION_SYSTEM_PROMPT = `You consolidate a coding agent's long-term memory store.
 
@@ -58,6 +61,7 @@ TO: <new keyword>
 Rules:
 - Use ids exactly as given; never invent one.
 - Only merge memories from the same layer (global with global, project with project).
+- A <likely-duplicates> section may be attached: those pairs were flagged by a deterministic similarity check and may reference ids that are NOT in the page above. They are hints, not verdicts — judge them like any other pair.
 - A kept memory must end up with 1-3 keywords. A keyword is at most 8 Chinese characters or 8 english words.
 - Prefer the more complete version of the text when you merge; keep concrete details (paths, commands, versions) and drop repetition.
 - If there is nothing to merge, respond with exactly: NOTHING_TO_MERGE`;
@@ -82,8 +86,16 @@ export interface ConsolidationResult {
  * `limit` is a guard: a caller that forgot to page cannot send a huge prompt.
  * Covering the rest of the store is the caller's job — see runConsolidation,
  * which pages through everything.
+ *
+ * `hints` are near-duplicate pairs computed over the WHOLE store. Pages are
+ * time-ordered, so two duplicates recorded months apart rarely share a page;
+ * naming the pairs closes that blind spot (the ids may sit outside the page).
  */
-export function buildConsolidationPrompt(entries: { entry: MemoryEntry; file: string }[], limit = MAX_ENTRIES_IN_PROMPT): string {
+export function buildConsolidationPrompt(
+	entries: { entry: MemoryEntry; file: string }[],
+	limit = MAX_ENTRIES_IN_PROMPT,
+	hints: DuplicateCandidate[] = [],
+): string {
 	const sorted = [...entries].sort((a, b) => (a.entry.time < b.entry.time ? 1 : -1));
 	const shown = sorted.slice(0, limit);
 	const lines = shown.map(({ entry, file }) => {
@@ -91,7 +103,11 @@ export function buildConsolidationPrompt(entries: { entry: MemoryEntry; file: st
 		return `[${entry.id}] ${entry.layer} ${file} | keywords: ${kw}\n${entry.text}`;
 	});
 	const note = sorted.length > shown.length ? `\n\n(${sorted.length - shown.length} older memories omitted from this prompt.)` : "";
-	return `<memories>\n${lines.join("\n\n")}\n</memories>${note}\n\nRespond with merge/rename blocks, or NOTHING_TO_MERGE.`;
+	const hintBlock =
+		hints.length > 0
+			? `\n\n<likely-duplicates>\n${hints.slice(0, MAX_HINTS).map((h) => `- ${describeCandidate(h, 50)}`).join("\n")}\n</likely-duplicates>`
+			: "";
+	return `<memories>\n${lines.join("\n\n")}\n</memories>${note}${hintBlock}\n\nRespond with merge/rename blocks, or NOTHING_TO_MERGE.`;
 }
 
 /**
@@ -154,6 +170,9 @@ function filesForLayer(layer: Layer): readonly string[] {
 	return layer === "project" ? PROJECT_CATEGORY_FILES : GLOBAL_CATEGORY_FILES;
 }
 
+/** Both layers, in the order the UI lists them. */
+export const ALL_LAYERS: readonly Layer[] = ["global", "project"];
+
 /**
  * Run a consolidation pass over the WHOLE store, paging through it.
  *
@@ -172,11 +191,15 @@ function filesForLayer(layer: Layer): readonly string[] {
  * A failed call ends the pass (the store keeps whatever was already applied),
  * and MAX_ROUNDS bounds one invocation.
  *
+ * Scoping: `layers` restricts the pass to those layers. Consolidating the global
+ * layer from inside a project command would rewrite the user's shared store every
+ * time any project runs `/memory compact`, so callers scope explicitly.
+ *
  * Known limitation: pages are time-ordered, so two duplicates that land in
- * DIFFERENT pages are never shown to the model together. This is far narrower
- * than the old behaviour (where everything past the newest 120 was invisible),
- * but it is not zero. Making pages keyword-clustered instead would close it, at
- * the cost of a different page order.
+ * DIFFERENT pages are never shown to the model together. `dry-run` candidates
+ * computed over the whole pool are therefore attached to every prompt as a
+ * <likely-duplicates> hint, which covers the common case (the same fact
+ * re-recorded months later); it does not make paging exhaustive.
  *
  * Never throws; returns counts of what actually changed.
  */
@@ -186,8 +209,10 @@ export async function runConsolidation(
 	model: unknown,
 	registry: unknown,
 	timeoutMs?: number,
+	layers: readonly Layer[] = ALL_LAYERS,
 ): Promise<ConsolidationResult> {
-	let pool = entries;
+	const scoped = entries.filter(({ entry }) => layers.includes(entry.layer));
+	let pool = scoped;
 	const examined = new Set<string>();
 	let rounds = 0;
 	let changedFiles = 0;
@@ -204,12 +229,16 @@ export async function runConsolidation(
 		rounds++;
 		for (const { entry } of page) examined.add(entry.id);
 
+		// Hints span the whole pool (not just this page): the pairs most worth
+		// merging are exactly the ones that time-ordered paging would separate.
+		const hints = findDuplicateCandidates(pool, { limit: MAX_HINTS });
+
 		const response = await completeWithSessionModel(
 			model as Parameters<typeof completeWithSessionModel>[0],
 			registry as Parameters<typeof completeWithSessionModel>[1],
 			{
 				systemPrompt: CONSOLIDATION_SYSTEM_PROMPT,
-				userPrompt: buildConsolidationPrompt(page),
+				userPrompt: buildConsolidationPrompt(page, MAX_ENTRIES_IN_PROMPT, hints),
 				maxTokens: deps.llmMaxTokens,
 				...(timeoutMs !== undefined ? { timeoutMs } : {}),
 			},
@@ -222,11 +251,20 @@ export async function runConsolidation(
 		if (nothingToDo) continue; // next page
 
 		const byId = new Map(page.map(({ entry }) => [entry.id, entry]));
+		// Let a hinted pair name an id that is not on this page, otherwise the hint
+		// could never be acted on (parse drops unknown ids).
+		for (const hint of hints) {
+			for (const side of [hint.a, hint.b]) {
+				if (byId.has(side.id)) continue;
+				const source = pool.find(({ entry }) => entry.id === side.id);
+				if (source) byId.set(side.id, source.entry);
+			}
+		}
 		const plan = parseConsolidationPlan(response.text, byId);
 		if (plan.merges.length === 0 && plan.keywordRenames.length === 0) continue;
 
 		let roundChanged = 0;
-		for (const layer of ["global", "project"] as const) {
+		for (const layer of layers) {
 			for (const file of filesForLayer(layer)) {
 				const target: WriteTarget = { layer, file: file as WriteTarget["file"] };
 				const applied = await applyConsolidation(target, deps, plan);

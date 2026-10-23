@@ -128,7 +128,7 @@ This is the memory index: one line per KEYWORD from a past session. The memory b
 
 When the current task touches any keyword below — including a synonym, a translation, or the user's own wording for it — call memory_search with mode:"tag" and that keyword BEFORE acting, answering, or asking the user. Add related terms you know (other languages, file names, tool names) to widen the search.
 
-The number in parentheses is how many memories share that keyword. "(+N more keywords)" means the table was truncated — use mode:"recent" for the newest memories.
+The number in parentheses is how many memories share that keyword. "(+N more)" means the table was truncated — search with mode:"keyword" and the topic you have in mind, or mode:"recent" for the newest memories.
 
 Never guess stored content. If nothing matches, say so instead of inventing it. memory_write requires 1-3 keywords: they are what future sessions will see.
 </memory-auto>`;

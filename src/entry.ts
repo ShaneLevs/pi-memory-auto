@@ -5,6 +5,16 @@
  * <!-- mid: 20261011-a1b2 | t: 2026-10-11 19:40:00 | p: myproject | src: user | tags: auth,db -->
  * body text (may be multi-line, until a blank line followed by another entry comment or EOF)
  *
+ * A re-confirmed memory keeps one row and carries two extra fields:
+ * <!-- mid: 20261011-a1b2 | t: ... | p: ... | src: ... | tags: ... | seen: 3 | last: 2026-10-24 09:00:00 -->
+ * `seen` is how many times the same body was written again, `last` when it last
+ * was. Both are omitted while seen === 1, so a normal entry's bytes are
+ * unchanged from the original format.
+ *
+ * A replaced memory keeps its row too, marked instead of deleted:
+ *   ... | supersedes: 20261011-a1b2 -->      (on the new, corrected entry)
+ *   ... | superseded-by: 20261020-c3d4 -->   (on the entry it replaced)
+ *
  * This module is the single source of truth for the on-disk entry format.
  */
 
@@ -38,13 +48,45 @@ function escapeField(s: string): string {
 	return s.replace(/\|/g, "\\|").trim();
 }
 
-/** Serialize one entry to its on-disk markdown form (ends with newline). */
-export function serializeEntry(entry: MemoryEntry): string {
+/**
+ * Serialize the metadata comment line of one entry (no trailing newline).
+ *
+ * Used both by serializeEntry and by the in-place `seen`/`last` bump, so the
+ * bump rewrites exactly one line and leaves the body bytes untouched.
+ */
+/** Entry id shape: YYYYMMDD-xxxx. */
+export const ENTRY_ID_RE = /^\d{8}-[0-9a-f]{4}$/i;
+
+export function serializeMetaLine(entry: MemoryEntry): string {
 	const tags = entry.tags.length > 0 ? escapeField(entry.tags.join(",")) : "-";
 	const project = escapeField(entry.project || "-");
-	const meta = `${ENTRY_META_PREFIX} ${entry.id} | t: ${entry.time} | p: ${project} | src: ${entry.source} | tags: ${tags} -->`;
-	const text = entry.text.trim();
-	return `${meta}\n${text}\n\n`;
+	const seen = entry.seen ?? 1;
+	// Omitted at 1 so entries that were never re-confirmed keep the original bytes.
+	const repeat = seen > 1 ? ` | seen: ${seen} | last: ${escapeField(entry.last ?? entry.time)}` : "";
+	const supersedes = entry.supersedes && entry.supersedes.length > 0 ? ` | supersedes: ${entry.supersedes.join(",")}` : "";
+	const supersededBy = entry.supersededBy ? ` | superseded-by: ${entry.supersededBy}` : "";
+	return `${ENTRY_META_PREFIX} ${entry.id} | t: ${entry.time} | p: ${project} | src: ${entry.source} | tags: ${tags}${supersedes}${supersededBy}${repeat} -->`;
+}
+
+/** Serialize one entry to its on-disk markdown form (ends with newline). */
+export function serializeEntry(entry: MemoryEntry): string {
+	return `${serializeMetaLine(entry)}\n${entry.text.trim()}\n\n`;
+}
+
+/**
+ * Normalize a memory body for write-time idempotency.
+ *
+ * Deliberately conservative: only case, whitespace and trailing punctuation are
+ * ignored. Stripping more (all punctuation, word order) would make genuinely
+ * different memories collide, and a collision silently drops the second one.
+ */
+export function normalizeMemoryText(text: string): string {
+	return text
+		.toLowerCase()
+		.replace(/\s+/g, " ")
+		.trim()
+		.replace(/[.。;；,，:：!！?？]+$/u, "")
+		.trim();
 }
 
 /**
@@ -114,5 +156,29 @@ function parseMetaLine(line: string): MemoryEntry {
 	const source: MemorySource = fields.src === "auto" ? "auto" : "user";
 	const layer: Layer = project ? "project" : "global";
 	const tags = fields.tags && fields.tags !== "-" ? fields.tags.split(",").map((t) => t.trim()).filter(Boolean) : [];
-	return { id, time, project, layer, source, tags, text: "" };
+	// Legacy entries have neither field; a malformed count means "once", never
+	// "zero" — the counter only ever grows.
+	const parsedSeen = fields.seen ? Number.parseInt(fields.seen, 10) : Number.NaN;
+	const seen = Number.isFinite(parsedSeen) && parsedSeen > 1 ? parsedSeen : undefined;
+	const last = fields.last && fields.last !== "-" ? fields.last : undefined;
+	// Ids are shape-checked on read: a hand-edited or truncated file must not be
+	// able to make an entry point at garbage, or de-index itself.
+	const supersedes = (fields.supersedes ?? "")
+		.split(/[,\s]+/)
+		.map((s) => s.trim())
+		.filter((s) => ENTRY_ID_RE.test(s) && s !== id);
+	const supersededBy = fields["superseded-by"] && ENTRY_ID_RE.test(fields["superseded-by"]) ? fields["superseded-by"] : undefined;
+	return {
+		id,
+		time,
+		project,
+		layer,
+		source,
+		tags,
+		text: "",
+		...(seen ? { seen } : {}),
+		...(last ? { last } : {}),
+		...(supersedes.length > 0 ? { supersedes } : {}),
+		...(supersededBy ? { supersededBy } : {}),
+	};
 }

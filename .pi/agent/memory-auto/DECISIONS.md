@@ -7,3 +7,27 @@ pi-memory-auto: render overflow (> renderBudget) at injection time now schedules
 <!-- mid: 20261013-9161 | t: 2026-10-13 21:01:10 | p: pi-memory-auto | src: user | tags: serializeconversation,memory-extraction,dedup -->
 pi-memory-auto's extraction/review input uses pi's official `serializeConversation(convertToLlm(...))` (compaction path) instead of a plain user/assistant transcript, so the LLM sees `[Assistant tool calls]` / `[Tool result]` lines (tool output truncated to ~2000 chars) — officially recommended in compaction.md, near one-line change. The extraction/review prompt also carries an "Existing memories" digest (capped 4k chars): current memory / user profile / project memory, following pi-hermes-memory's `buildDirectReviewUserPrompt` and its `--- Current Memory ---` / `--- Current User Profile ---` / `--- Current Project Memory ---` sections, so the model incrementally updates and dedups instead of re-extracting; user explicitly required this ("需要带上现有记忆"). Transcript capped at 60k chars keeping the tail. Research reference repos live in /tmp/pi-mem-research/ (pi-memory, pi-hermes-memory, pmem, qmd).
 
+<!-- mid: 20261024-da83 | t: 2026-10-24 00:15:48 | p: pi-memory-auto | src: auto | tags: memory-injection,memory.md,single-source -->
+用户期望 `<memory-auto>` 注入块直接就是 `MEMORY.md` 的内容——他在 MEMORY.md 里写关键词行，目的就是让这份清单被注入。当前实现是在 `before_agent_start` 里从各分类文件现算 `collectKeywords()`/`renderKeywordTable()` 再拼 preamble，`MEMORY.md` 只是同一份表的落盘副本（建索引时被显式跳过、手改会被覆盖），用户把这套"再生成一次"视为多此一举。后续改注入逻辑时，应让 MEMORY.md 成为唯一真源（注入即读该文件），而不是维持两条渲染路径。
+
+<!-- mid: 20261024-4287 | t: 2026-10-24 00:15:48 | p: pi-memory-auto | src: auto | tags: consolidation,分页,compact -->
+pi-memory-auto 的 consolidation 采用「真分页」方案（用户在两选项中明确选了 A 而非按关键词聚簇的 B）：每轮最多 120 条未检查过的条目、按时间倒序、合并后重新读盘、LLM 调用失败即终止、`MAX_ROUNDS=12` 兜底，`ConsolidationResult` 增加 `rounds` 字段。已文档化的残留缺口是跨页重复检测不到（页按时间排），根治需把分页顺序改成关键词聚簇。用户明确要求**不要**在 `/memory compact` 输出里报「还有 N 条未覆盖」，保持提示简洁。
+
+<!-- mid: 20261024-d27a | t: 2026-10-24 00:17:34 | p: pi-memory-auto | src: auto | tags: memory-injection,memory.md,自动维护 -->
+MEMORY.md 的归属最终定调（用户的答复推翻了「自动区 + 手写区」双区方案）：MEMORY.md 必须**完全由程序自动写入和编辑**，用户在正常使用中永远不需要、也不应该直接接触它；每次保存记忆写关键词时都要同步落一份，build / rebuild / compact 之后同样要重新同步；注入上下文给模型的就是这份文件的内容，不再保留「从分类文件现算 `collectKeywords()`/`renderKeywordTable()` 再拼 preamble」的第二条渲染路径。缺了这份同步正是 0.4.0「MEMORY.md 从未被创建 → 注入空块」事故的成因。另外 `src/search.ts` 里把 MEMORY.md 当数据源解析、并给 `+0.5` 打分的代码是从未生效的死代码（关键词行没有 `<!-- mid:` 元数据），应在改造时删掉以免再次误导。
+
+<!-- mid: 20261024-3b98 | t: 2026-10-24 00:18:11 | p: pi-memory-auto | src: auto | tags: memory.md,同步时机,memory-injection -->
+pi-memory-auto v0.7.1 的实际实现（修正「注入即读 MEMORY.md」的旧理解）：`loadAllEntries()` 只读六个分类文件，`index-map` 显式跳过 `MEMORY.md`，`before_agent_start` 仍从分类文件现算 `collectKeywords()`/`renderKeywordTable()`，**注入时从不回读 MEMORY.md**。因此 MEMORY.md 是程序独占的落盘副本，过期只是观感问题，但要求所有写路径必须 await 落盘：`index.ts` 里原来的 `void refreshIndexes(ctx)` / `void materializeAll(...)` fire-and-forget 已改成 `syncIndexesNow()`（= `await materializeAll` + `maybeConsolidate`），保证 `memory_write`/shutdown 返回时关键词已经写进文件。同时删掉 `search.ts` 中把 MEMORY.md 当数据源的解析、`curated` +0.5 打分和 `pathJoin` 死代码——它们让人误以为索引文件可以手写条目。
+
+<!-- mid: 20261024-b483 | t: 2026-10-24 00:18:21 | p: pi-memory-auto | src: user | tags: memory-md,程序独占,索引同步 -->
+pi-memory-auto 的 MEMORY.md 定位（用户明确要求）：永远由程序独占写入，用户不直接编辑、不接触。它是派生状态，不是注入源 —— 注入时从分类文件实时渲染关键词表；文件在每次 memory_write / rebuild / compact / session_start 时重写同步，写入路径 await 到落盘才返回（syncIndexesNow）。不要再把它改成「可手写的注入源」（双区/并集追加方案已讨论后否决）。
+
+<!-- mid: 20261024-6a7c | t: 2026-10-24 00:23:58 | p: pi-memory-auto | src: user | tags: compact-rebuild,层级隔离,memory-command -->
+pi-memory-auto 的 /memory compact 与 /memory rebuild 必须按层隔离执行：/memory compact project|user、/memory rebuild project|user。不带层级只报用法（绝不默认处理两层），否则每个项目执行一次都会重复处理同一批用户级记忆并反复 churn 用户级 MEMORY.md。自动后台 consolidation 同样只传「达到阈值的层」。实现上 runConsolidation(…, layers) 过滤 entries 且只写该层文件，materializeAll({layers}) 只写该层 MEMORY.md。
+
+<!-- mid: 20261024-c522 | t: 2026-10-24 02:03:03 | p: pi-memory-auto | src: user | tags: 遗忘策略,supersede,staleness -->
+pi-memory-auto 0.8.0 的「遗忘」只有两级，且都零数据风险：(1) supersede 软失效 — memory_write 的 supersedes:[id] / extractor 的 SUPERSEDES: 行给旧条目加 metadata `superseded-by`，旧行保留、正文不动，但退出 MEMORY.md 关键词表、在 search 里永远排最后并标注；(2) staleness 复查 — 按文件类型给周期（TOOLING 3 月 / USER·CONVENTIONS 6 月 / LESSONS·FAILURES·DECISIONS 12 月），从 entry 自身时间戳（re-confirm 后取 `last`）现算，不落新字段、不迁移，到期只在搜索结果里降权并标注 stale，绝不删除。明确否决自动删除/decay/eviction：调研里 agentmemory、mcp-memory-service 的淘汰都把记忆生死押在 LLM 打的 importance 分上，分数漂移就静默丢数据；判断「这条还有替身吗」是确定性系统能做的，判断「这条还有用吗」不是。
+
+<!-- mid: 20261024-5d1e | t: 2026-10-24 02:03:03 | p: pi-memory-auto | src: user | tags: 写入幂等,usage-log,关键词排序 -->
+pi-memory-auto 0.8.0 的写入与索引侧三个确定性机制：写入幂等 —— `normalizeMemoryText`（仅忽略大小写/空白/尾部标点）后在同层三个分类文件里找同文条目，命中则不新增行，只在 meta 上加 `seen: N | last: <time>`（seen===1 时省略字段，保持旧条目字节不变）；usage 边车 —— `memory_search` 第 1 页命中时把「查询里出现且命中条目携带」的关键词计入 `<layer>/usage.json`（不是记忆条目、不参与注入），索引排序改为 `count + min(recalls,4)`，且 usage 故意不作为重新渲染触发点（否则每次搜索都会打穿 prefix cache）；索引预算耗尽时分级降级 —— 先摘掉 `(count)` 后缀把剩余关键词塞进续行，实在放不下才写 `(+N more — memory_search mode:"keyword")`（旧提示指向 mode:"recent" 是最弱检索）。
+

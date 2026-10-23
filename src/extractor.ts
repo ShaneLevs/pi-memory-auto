@@ -10,6 +10,7 @@
  */
 
 import { CLASSIFICATION_RUBRIC, MIN_MESSAGES_FOR_REVIEW, TRANSCRIPT_MAX_CHARS } from "./constants.ts";
+import { ENTRY_ID_RE } from "./entry.ts";
 import { deriveKeyword, sanitizeKeywords } from "./keywords.ts";
 import { convertToLlm, serializeConversation } from "@earendil-works/pi-coding-agent";
 import { completeWithSessionModel } from "./llm.ts";
@@ -27,9 +28,9 @@ its tools returned. Use them as evidence for failures, corrections, and tool qui
 but never invent process details that are not recorded, and never save a "lesson" unless
 the transcript itself supports it.
 
-The "Existing memories" section lists what is already stored. Its only purpose is dedup:
-skip a candidate when an equivalent entry exists; refine an existing one only when the
-transcript clearly adds something material.
+The "Existing memories" section lists what is already stored, with each entry's id. Its two purposes are
+dedup and correction: skip a candidate when an equivalent entry exists, and when a candidate CONTRADICTS or
+CORRECTS an existing memory, name that memory's id in SUPERSEDES instead of writing a second, conflicting entry.
 
 Output format — respond with entries, one block per memory, nothing else:
 
@@ -37,12 +38,17 @@ Output format — respond with entries, one block per memory, nothing else:
 FILE: <USER.md | TOOLING.md | LESSONS.md | CONVENTIONS.md | DECISIONS.md | FAILURES.md>
 LAYER: <global | project>
 TAGS: <1-3 comma separated keywords>
+SUPERSEDES: <ids of existing memories this entry replaces, comma separated, or ->
 TEXT: <the memory text, concise, self-contained, one sentence to one short paragraph>
 
 Rules:
 - Follow the classification guide above strictly.
 - At most 3 entries per review; quality over quantity.
 - Every entry needs 1-3 keywords: the terms a future session would search for. Reuse an existing keyword when it fits instead of inventing a synonym. Each keyword is at most 8 Chinese characters or 8 english words.
+- SUPERSEDES takes at most 2 ids, copied literally from the "Existing memories" list, and only when the
+  new entry says the same thing differently or replaces what they claimed. The old entries are kept on
+  disk, stop being injected, and rank below the new one — nothing is deleted, so prefer superseding over
+  writing a parallel entry that disagrees with the old one.
 - If nothing is worth saving, respond with exactly: NOTHING_TO_SAVE
 - Do not store secrets, API keys, or tokens.`;
 
@@ -60,12 +66,15 @@ export function buildReviewUserPrompt(transcript: string, existingMemories: stri
 	return sections.join("\n");
 }
 
+/** Max ids one candidate may supersede. */
+export const MAX_SUPERSEDES = 2;
+
 /** Parse the ===ENTRY=== blocks from a review response. */
 export function parseReviewResponse(
 	response: string,
 	projectName: string,
-): { target: WriteTarget; tags: string[]; text: string }[] {
-	const out: { target: WriteTarget; tags: string[]; text: string }[] = [];
+): { target: WriteTarget; tags: string[]; text: string; supersedes: string[] }[] {
+	const out: { target: WriteTarget; tags: string[]; text: string; supersedes: string[] }[] = [];
 	// "NOTHING_TO_SAVE" only means empty when it appears outside of entry blocks.
 	const hasEntries = response.includes("===ENTRY===");
 	if (!hasEntries && response.includes("NOTHING_TO_SAVE")) return out;
@@ -75,6 +84,7 @@ export function parseReviewResponse(
 		const layerMatch = /^LAYER:\s*(\S+)\s*$/m.exec(block);
 		const tagsMatch = /^TAGS:\s*(.*)$/m.exec(block);
 		const textMatch = /^TEXT:\s*([\s\S]*?)(?=\n===ENTRY===|$)/m.exec(block);
+		const supersedesMatch = /^SUPERSEDES:\s*(.*)$/m.exec(block);
 		if (!fileMatch?.[1] || !textMatch?.[1]) continue;
 		const file = fileMatch[1].replace(/\.md$/i, "").toUpperCase();
 		const layer: Layer = layerMatch?.[1]?.toLowerCase() === "global" ? "global" : "project";
@@ -92,7 +102,14 @@ export function parseReviewResponse(
 		const { keywords } = sanitizeKeywords(candidates);
 		// At least one keyword per memory: derive one when the model gave none.
 		const tags = keywords.length > 0 ? keywords : [deriveKeyword(text)];
-		out.push({ target: { layer, file: file as WriteTarget["file"] }, tags, text });
+		// Ids from the model are untrusted: shape-checked here, layer-checked and
+		// de-duplicated by markSuperseded. An unknown id simply changes nothing.
+		const supersedes = (supersedesMatch?.[1] ?? "")
+			.split(/[,\s]+/)
+			.map((id) => id.trim())
+			.filter((id) => ENTRY_ID_RE.test(id))
+			.slice(0, MAX_SUPERSEDES);
+		out.push({ target: { layer, file: file as WriteTarget["file"] }, tags, text, supersedes });
 	}
 	return out;
 }
@@ -157,15 +174,19 @@ export async function runReview(
 	const candidates = parseReviewResponse(result.text, deps.projectRoot);
 	for (const c of candidates) {
 		// Category-file-only writes enforced by parse (isWritableTarget) + appendEntry.
-		const entry = await appendEntry(c.target, c.text, {
+		const outcome = await appendEntry(c.target, c.text, {
 			tags: c.tags,
 			source: "auto",
 			globalDir: deps.globalDir,
 			projectRoot: deps.projectRoot,
 			mutex: deps.mutex,
 			plock: deps.plock,
+			...(c.supersedes.length > 0 ? { supersedes: c.supersedes } : {}),
 		});
-		written.push(entry);
+		// A re-confirmation is not new information: nothing was appended, so it must
+		// not count as "saved N memories". It still has to reach the caller when it
+		// superseded entries, because that changes the index.
+		if (!outcome.deduped || outcome.superseded > 0) written.push(outcome.entry);
 	}
 	return written;
 }

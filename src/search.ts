@@ -14,9 +14,10 @@
  * matched), then tag hits, then recency.
  */
 
-import { MAIN_FILE, PROJECT_CATEGORY_FILES, GLOBAL_CATEGORY_FILES } from "./constants.ts";
+import { PROJECT_CATEGORY_FILES, GLOBAL_CATEGORY_FILES } from "./constants.ts";
 import { parseEntries, parseTime } from "./entry.ts";
 import { MAX_KEYWORDS, coerceKeywords, keywordKey } from "./keywords.ts";
+import { daysSinceVerified, isStale, reviewMonthsFor } from "./staleness.ts";
 import { categoryFilePath, memoryDir, readFileOrEmpty } from "./store.ts";
 import type { MemoryEntry, SearchHit, SearchMode, SearchResult } from "./types.ts";
 
@@ -26,11 +27,16 @@ export interface LoadedEntry {
 	file: string;
 }
 
-/** Load all entries from both layers (category files + the index file). */
+/** Load all entries from both layers (category files only).
+ *
+ * MEMORY.md is deliberately NOT read: it is program-owned derived state
+ * (a keyword table, no `mid` metadata), never a source of entries. Parsing it
+ * here used to add nothing but confusion — it suggested the index file could
+ * carry hand-written memories, which the extension never supported.
+ */
 export async function loadAllEntries(globalDir: string, projectRoot: string): Promise<LoadedEntry[]> {
 	const out: LoadedEntry[] = [];
 	for (const layer of ["project", "global"] as const) {
-		const dir = memoryDir(layer, globalDir, projectRoot);
 		const files = layer === "project" ? PROJECT_CATEGORY_FILES : GLOBAL_CATEGORY_FILES;
 		for (const f of files) {
 			const filePath = categoryFilePath({ layer, file: f }, globalDir, projectRoot);
@@ -39,18 +45,8 @@ export async function loadAllEntries(globalDir: string, projectRoot: string): Pr
 			// even if an entry's metadata says otherwise.
 			for (const entry of parseEntries(raw)) out.push({ entry: { ...entry, layer }, file: `${layer}/${f}.md` });
 		}
-		// MEMORY.md is a generated index now; parse it too so hand-annotated
-		// entries (if any) stay searchable. Index lines have no metadata and
-		// are ignored by the parser.
-		const mainRaw = await readFileOrEmpty(pathJoin(dir, MAIN_FILE));
-		for (const entry of parseEntries(mainRaw)) out.push({ entry: { ...entry, layer }, file: `${layer}/${MAIN_FILE}` });
 	}
 	return out;
-}
-
-import path from "node:path";
-function pathJoin(dir: string, file: string): string {
-	return path.join(dir, file);
 }
 
 /** Words ignored when tokenizing a query (English + common Chinese). */
@@ -126,9 +122,7 @@ function scoreEntry(loaded: LoadedEntry, tokens: string[]): Scored | null {
 	if (matched === 0) return null;
 
 	const coverage = matched / tokens.length;
-	// Curated index-file entries rank slightly higher.
-	const curated = file.endsWith(MAIN_FILE) ? 0.5 : 0;
-	const score = coverage * 10 + tagExact * 4 + tagPartial * 2 + textHits * 0.5 + curated;
+	const score = coverage * 10 + tagExact * 4 + tagPartial * 2 + textHits * 0.5;
 	return { entry, file, score, matched };
 }
 
@@ -143,9 +137,20 @@ function scoreEntry(loaded: LoadedEntry, tokens: string[]): Scored | null {
  * keyword/all fall back to the newest entries when nothing matched, instead of
  * returning an empty result — an index keyword that misses should still show
  * the agent what exists.
+ *
+ * `opts.reviewMonths` overrides the staleness interval (see staleness.ts);
+ * `opts.now` makes the call deterministic in tests.
  */
-export function searchEntries(all: LoadedEntry[], mode: SearchMode, query: string, page: number, pageSize: number): SearchResult {
-	const now = Date.now();
+export function searchEntries(
+	all: LoadedEntry[],
+	mode: SearchMode,
+	query: string,
+	page: number,
+	pageSize: number,
+	opts: { reviewMonths?: number; now?: number } = {},
+): SearchResult {
+	const now = opts.now ?? Date.now();
+	const staleOpts = { now, reviewMonths: opts.reviewMonths ?? 0 };
 	const q = query.trim();
 	const tokens = tokenize(q);
 	let hits: Scored[] = [];
@@ -224,8 +229,29 @@ export function searchEntries(all: LoadedEntry[], mode: SearchMode, query: strin
 	}
 
 	const total = hits.length;
+	// Superseded entries stay retrievable (the old wording often still carries a
+	// detail the replacement dropped) but must never outrank a live memory. Stale
+	// ones rank between the two: still true until proven otherwise, but worth
+	// less than a memory someone confirmed recently. A stable sort keeps each
+	// mode's own ordering intact inside the groups.
+	// Ranks are computed once per entry: the comparator runs thousands of times
+	// and `isStale` parses a timestamp.
+	const ranks = new Map<string, number>();
+	const rank = (hit: { entry: MemoryEntry; file: string }): number => {
+		const cached = ranks.get(hit.entry.id);
+		if (cached !== undefined) return cached;
+		const value = hit.entry.supersededBy ? 2 : isStale(hit.entry, hit.file, staleOpts) ? 1 : 0;
+		ranks.set(hit.entry.id, value);
+		return value;
+	};
+	hits.sort((a, b) => rank(a) - rank(b));
 	const start = Math.max(0, (page - 1) * pageSize);
-	const pageHits: SearchHit[] = hits.slice(start, start + pageSize).map((h) => ({ entry: h.entry, file: h.file, score: h.score }));
+	const pageHits: SearchHit[] = hits.slice(start, start + pageSize).map((h) => ({
+		entry: h.entry,
+		file: h.file,
+		score: h.score,
+		...(rank(h) === 1 ? { stale: true } : {}),
+	}));
 	return { hits: pageHits, total, page, pageSize, hasMore: start + pageSize < total, fallback, tokens };
 }
 
@@ -248,7 +274,11 @@ export function formatSearchResult(result: SearchResult, mode: SearchMode, query
 	for (const hit of result.hits) {
 		const e = hit.entry;
 		const tags = e.tags.length > 0 ? e.tags.join(",") : "-";
-		lines.push(`[${e.id}] ${hit.file} | ${e.time} | src: ${e.source} | tags: ${tags}`);
+		const replaced = e.supersededBy ? ` | superseded by [${e.supersededBy}] — prefer that entry` : "";
+		// The label is the whole point of staleness: the memory is still returned,
+		// but the agent is told to verify it instead of trusting it.
+		const stale = !e.supersededBy && hit.stale ? ` | stale (${daysSinceVerified(e)}d, interval ${reviewMonthsFor(hit.file)}mo) — verify before relying on it` : "";
+		lines.push(`[${e.id}] ${hit.file} | ${e.time} | src: ${e.source} | tags: ${tags}${replaced}${stale}`);
 		lines.push(e.text);
 		lines.push("");
 	}

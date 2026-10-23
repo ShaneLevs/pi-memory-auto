@@ -261,3 +261,79 @@ test("a failed call stops the pass instead of hammering the provider", async () 
 	assert.equal(result.rounds, 1);
 	assert.equal(result.noop, true);
 });
+
+// ── Layer scoping: a project command must not rewrite the user's store ──────
+
+/** Writes one entry into each layer and returns the two file paths. */
+async function writeBothLayers(projectRoot: string, globalDir: string) {
+	const projFile = path.join(projectRoot, ".pi/agent/memory-auto/DECISIONS.md");
+	const globFile = path.join(globalDir, "LESSONS.md");
+	await fs.mkdir(path.dirname(projFile), { recursive: true });
+	await fs.mkdir(globalDir, { recursive: true });
+	await fs.writeFile(projFile, `${meta("20261001-aaaa", "deploy", "proj")}project one\n\n`, "utf8");
+	await fs.writeFile(globFile, `${meta("20261002-bbbb", "deploy", "")}global one\n\n`, "utf8");
+	return { projFile, globFile };
+}
+
+test("scoping a pass to one layer never sends the other layer to the model", async () => {
+	const { projectRoot, globalDir, deps } = await setup();
+	const { projFile, globFile } = await writeBothLayers(projectRoot, globalDir);
+	await fs.writeFile(projFile, `${meta("20261001-aaaa", "deploy", "proj")}project one\n\n${meta("20261003-cccc", "deploy", "proj")}project two\n\n`, "utf8");
+
+	const prompts: string[] = [];
+	const registry = {
+		complete: async (_m: unknown, context: unknown) => {
+			prompts.push(JSON.stringify(context));
+			return { content: [{ type: "text", text: "NOTHING_TO_MERGE" }], stopReason: "stop" };
+		},
+	};
+	const entries = await loadAllEntries(globalDir, projectRoot);
+	assert.equal(entries.length, 3);
+
+	await runConsolidation(deps, entries, {}, registry, undefined, ["project"]);
+
+	assert.equal(prompts.length, 1);
+	assert.ok(prompts[0]!.includes("20261001-aaaa"));
+	assert.ok(prompts[0]!.includes("20261003-cccc"));
+	assert.ok(!prompts[0]!.includes("20261002-bbbb"), "global entry leaked into a project-scoped pass");
+	// The global file is untouched.
+	assert.match(await fs.readFile(globFile, "utf8"), /20261002-bbbb/);
+});
+
+test("a scoped merge applies only to that layer's files", async () => {
+	const { projectRoot, globalDir, deps } = await setup();
+	await writeBothLayers(projectRoot, globalDir);
+	const projFile = path.join(projectRoot, ".pi/agent/memory-auto/DECISIONS.md");
+	await fs.writeFile(projFile, `${meta("20261001-aaaa", "deploy", "proj")}one\n\n${meta("20261003-cccc", "deploy", "proj")}two\n\n`, "utf8");
+	const beforeGlob = await fs.readFile(path.join(globalDir, "LESSONS.md"), "utf8");
+
+	const registry = {
+		complete: async () => ({
+			content: [{ type: "text", text: "===MERGE===\nKEEP: 20261001-aaaa\nDROP: 20261003-cccc" }],
+			stopReason: "stop",
+		}),
+	};
+	const entries = await loadAllEntries(globalDir, projectRoot);
+	const result = await runConsolidation(deps, entries, {}, registry, undefined, ["project"]);
+	assert.equal(result.removed, 1);
+	assert.equal(result.changedFiles, 1);
+	assert.equal(await fs.readFile(path.join(globalDir, "LESSONS.md"), "utf8"), beforeGlob, "global file must be untouched");
+});
+
+test("a global-scoped pass leaves the project layer alone", async () => {
+	const { projectRoot, globalDir, deps } = await setup();
+	const { projFile } = await writeBothLayers(projectRoot, globalDir);
+	await fs.writeFile(path.join(globalDir, "LESSONS.md"), `${meta("20261002-bbbb", "deploy", "")}one\n\n${meta("20261004-dddd", "deploy", "")}two\n\n`, "utf8");
+	const beforeProj = await fs.readFile(projFile, "utf8");
+
+	const registry = {
+		complete: async () => ({
+			content: [{ type: "text", text: "===MERGE===\nKEEP: 20261002-bbbb\nDROP: 20261004-dddd" }],
+			stopReason: "stop",
+		}),
+	};
+	const entries = await loadAllEntries(globalDir, projectRoot);
+	const result = await runConsolidation(deps, entries, {}, registry, undefined, ["global"]);
+	assert.equal(result.removed, 1);
+	assert.equal(await fs.readFile(projFile, "utf8"), beforeProj, "project file must be untouched");
+});

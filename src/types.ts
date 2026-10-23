@@ -32,6 +32,25 @@ export interface MemoryEntry {
 	tags: string[];
 	/** Entry body (the memory text itself, may be multi-line). */
 	text: string;
+	/**
+	 * How many times this same body was written. Absent (or 1) means once; the
+	 * counter grows when a duplicate write is collapsed into this entry instead
+	 * of appending a second row.
+	 */
+	seen?: number;
+	/** Timestamp of the last re-confirmation, same format as `time`. */
+	last?: string;
+	/**
+	 * Ids of the entries this one replaces (the corrected wording). Recorded on
+	 * the NEW entry; the replaced ones get `supersededBy`. Nothing is deleted.
+	 */
+	supersedes?: string[];
+	/**
+	 * When set, a newer entry replaced this one. A superseded entry stays on disk
+	 * and stays searchable (the old wording can still be useful), but it no
+	 * longer contributes keywords to the index and never outranks a live memory.
+	 */
+	supersededBy?: string;
 }
 
 /** Search modes for memory_search. */
@@ -44,6 +63,8 @@ export interface SearchHit {
 	file: string;
 	/** Match score (higher = better). For `recent` this is the timestamp. */
 	score: number;
+	/** True when the memory is past its review interval (staleness.ts). */
+	stale?: boolean;
 }
 
 /** Result returned to the model by memory_search. */
@@ -79,6 +100,11 @@ export interface MemoryConfig {
 	pageSize: number;
 	/** maxTokens for background LLM calls (extraction / handoff). */
 	llmMaxTokens: number;
+	/**
+	 * Review interval override in months for staleness (staleness.ts).
+	 * 0 = per-file defaults, negative = staleness disabled.
+	 */
+	reviewMonths: number;
 }
 
 /** Result details attached to tool results for UI rendering. */

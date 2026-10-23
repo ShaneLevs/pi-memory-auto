@@ -60,15 +60,16 @@ export async function runHandoff(
 		// 4th keyword: the 1-3 contract is what the index depends on, and a
 		// shared "handoff" keyword on every extracted entry is pure index noise.
 		const { keywords } = sanitizeKeywords([...c.tags, "handoff"]);
-		const entry = await appendEntry(c.target, c.text, {
+		const outcome = await appendEntry(c.target, c.text, {
 			tags: keywords.length > 0 ? keywords : c.tags,
 			source: "auto",
 			globalDir: deps.globalDir,
 			projectRoot: deps.projectRoot,
 			mutex: deps.mutex,
 			plock: deps.plock,
+			...(c.supersedes.length > 0 ? { supersedes: c.supersedes } : {}),
 		});
-		written.push(entry);
+		if (!outcome.deduped) written.push(outcome.entry);
 	}
 	return written;
 }

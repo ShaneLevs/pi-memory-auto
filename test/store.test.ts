@@ -17,7 +17,7 @@ after(async () => {
 });
 
 test("appendEntry writes serialized entry with metadata", async () => {
-	const entry = await appendEntry({ layer: "project", file: "FAILURES" }, "Things broke.", {
+	const outcome = await appendEntry({ layer: "project", file: "FAILURES" }, "Things broke.", {
 		tags: ["bug"],
 		source: "user",
 		globalDir,
@@ -25,6 +25,9 @@ test("appendEntry writes serialized entry with metadata", async () => {
 		mutex,
 		plock,
 	});
+	const entry = outcome.entry;
+	assert.equal(outcome.deduped, false);
+	assert.equal(outcome.file, "project/FAILURES.md");
 	assert.equal(entry.layer, "project");
 	assert.equal(entry.project, "proj");
 	const raw = await fs.readFile(path.join(projectRoot, ".pi/agent/memory-auto/FAILURES.md"), "utf8");
@@ -32,6 +35,107 @@ test("appendEntry writes serialized entry with metadata", async () => {
 	const parsed = parseEntries(raw);
 	assert.equal(parsed.length, 1);
 	assert.equal(parsed[0]!.text, "Things broke.");
+});
+
+test("appendEntry folds an identical body into the stored entry (seen/last bumped)", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "pma-dedup-"));
+	tmpDirs.push(root);
+	const g = path.join(root, "global");
+	const p = path.join(root, "proj");
+	const deps = { globalDir: g, projectRoot: p, mutex, plock };
+
+	const first = await appendEntry({ layer: "project", file: "DECISIONS" }, "Use PostgreSQL for JSON support.", { tags: ["db"], ...deps });
+	// Same body, different case/whitespace/trailing period: still the same memory.
+	const second = await appendEntry({ layer: "project", file: "DECISIONS" }, "use postgresql   for JSON support", { tags: ["db"], ...deps });
+
+	assert.equal(second.deduped, true);
+	assert.equal(second.entry.id, first.entry.id);
+	assert.equal(second.entry.seen, 2);
+
+	const raw = await fs.readFile(path.join(p, ".pi/agent/memory-auto/DECISIONS.md"), "utf8");
+	const parsed = parseEntries(raw);
+	assert.equal(parsed.length, 1, "no duplicate row was appended");
+	assert.equal(parsed[0]!.seen, 2);
+	assert.match(parsed[0]!.last ?? "", /^\d{4}-\d{2}-\d{2} /);
+	assert.match(raw, /\| seen: 2 \| last: /);
+});
+
+test("appendEntry dedupes across files of the same layer, not across layers", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "pma-dedup-layer-"));
+	tmpDirs.push(root);
+	const g = path.join(root, "global");
+	const p = path.join(root, "proj");
+	const deps = { globalDir: g, projectRoot: p, mutex, plock };
+
+	const first = await appendEntry({ layer: "project", file: "FAILURES" }, "Never trust the cached lockfile.", { tags: ["lock"], ...deps });
+	const second = await appendEntry({ layer: "project", file: "CONVENTIONS" }, "Never trust the cached lockfile.", { tags: ["lock"], ...deps });
+	assert.equal(second.deduped, true);
+	assert.equal(second.entry.id, first.entry.id);
+	assert.equal(second.file, "project/FAILURES.md");
+	assert.equal(await fs.stat(path.join(p, ".pi/agent/memory-auto/CONVENTIONS.md")).then(() => true, () => false), false);
+
+	// Same text in the other layer is a different memory (different audience).
+	const global = await appendEntry({ layer: "global", file: "LESSONS" }, "Never trust the cached lockfile.", { tags: ["lock"], ...deps });
+	assert.equal(global.deduped, false);
+});
+
+test("supersedes marks the replaced entry instead of deleting it", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "pma-supersede-"));
+	tmpDirs.push(root);
+	const deps = { globalDir: path.join(root, "g"), projectRoot: path.join(root, "p"), mutex, plock };
+	const file = path.join(root, "p", ".pi/agent/memory-auto/DECISIONS.md");
+
+	const old = await appendEntry({ layer: "project", file: "DECISIONS" }, "Use MySQL for the store.", { tags: ["db"], ...deps });
+	const fixed = await appendEntry({ layer: "project", file: "DECISIONS" }, "Use PostgreSQL for JSON support.", {
+		tags: ["db"],
+		supersedes: [old.entry.id],
+		...deps,
+	});
+
+	assert.equal(fixed.superseded, 1);
+	const parsed = parseEntries(await fs.readFile(file, "utf8"));
+	assert.equal(parsed.length, 2, "the replaced row is kept");
+	assert.equal(parsed[0]!.text, "Use MySQL for the store.");
+	assert.equal(parsed[0]!.supersededBy, fixed.entry.id);
+	assert.deepEqual(parsed[1]!.supersedes, [old.entry.id]);
+});
+
+test("supersedes ignores unknown, already-superseded and cross-layer ids", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "pma-supersede2-"));
+	tmpDirs.push(root);
+	const deps = { globalDir: path.join(root, "g"), projectRoot: path.join(root, "p"), mutex, plock };
+
+	const old = await appendEntry({ layer: "project", file: "DECISIONS" }, "Use MySQL.", { tags: ["db"], ...deps });
+	const glob = await appendEntry({ layer: "global", file: "LESSONS" }, "Never trust a cached lockfile.", { tags: ["lock"], ...deps });
+
+	// A global id passed from a project write must not be touched.
+	const first = await appendEntry({ layer: "project", file: "DECISIONS" }, "Use PostgreSQL.", {
+		tags: ["db"],
+		supersedes: [old.entry.id, glob.entry.id, "20990101-9999"],
+		...deps,
+	});
+	assert.equal(first.superseded, 1);
+
+	// Re-superseding an already-dead id is a no-op (the first replacement wins).
+	const second = await appendEntry({ layer: "project", file: "DECISIONS" }, "Use SQLite for the local cache.", {
+		tags: ["db"],
+		supersedes: [old.entry.id],
+		...deps,
+	});
+	assert.equal(second.superseded, 0);
+	const globalRaw = await fs.readFile(path.join(root, "g", "LESSONS.md"), "utf8");
+	assert.doesNotMatch(globalRaw, /superseded-by/);
+});
+
+test("appendEntry still appends near-but-different bodies", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "pma-dedup-diff-"));
+	tmpDirs.push(root);
+	const deps = { globalDir: path.join(root, "g"), projectRoot: path.join(root, "p"), mutex, plock };
+	const a = await appendEntry({ layer: "global", file: "TOOLING" }, "Use pnpm, not npm.", { tags: ["pnpm"], ...deps });
+	const b = await appendEntry({ layer: "global", file: "TOOLING" }, "Use pnpm, not npm, in this repo.", { tags: ["pnpm"], ...deps });
+	assert.equal(a.deduped, false);
+	assert.equal(b.deduped, false);
+	assert.notEqual(a.entry.id, b.entry.id);
 });
 
 test("concurrent appends all land (mutex serializes)", async () => {
@@ -91,4 +195,22 @@ test("applyTagUpdates is a no-op for identical or empty updates", async () => {
 	assert.equal((await applyTagUpdates({ layer: "project", file: "DECISIONS" }, deps, new Map([["20261001-aaaa", ["same"]]]))).changed, false);
 	assert.equal((await applyTagUpdates({ layer: "project", file: "DECISIONS" }, deps, new Map())).changed, false);
 	assert.equal(await fs.readFile(file, "utf8"), before);
+});
+
+test("re-asserting a superseded body appends a live row instead of bumping the dead one", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "pma-revive-"));
+	tmpDirs.push(root);
+	const deps = { globalDir: path.join(root, "g"), projectRoot: path.join(root, "p"), mutex, plock };
+	const file = path.join(root, "p", ".pi/agent/memory-auto/DECISIONS.md");
+
+	const old = await appendEntry({ layer: "project", file: "DECISIONS" }, "Use MySQL.", { tags: ["db"], ...deps });
+	await appendEntry({ layer: "project", file: "DECISIONS" }, "Use PostgreSQL.", { tags: ["db"], supersedes: [old.entry.id], ...deps });
+
+	const again = await appendEntry({ layer: "project", file: "DECISIONS" }, "Use MySQL.", { tags: ["db"], ...deps });
+	assert.equal(again.deduped, false, "the fact is being asserted again, so it must come back to life");
+	assert.notEqual(again.entry.id, old.entry.id);
+	const parsed = parseEntries(await fs.readFile(file, "utf8"));
+	assert.equal(parsed.length, 3);
+	assert.equal(parsed[0]!.supersededBy !== undefined, true, "the dead row stays dead");
+	assert.equal(parsed[2]!.supersededBy, undefined);
 });

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { generateEntryId, formatTime, parseEntries, parseTime, serializeEntry } from "../src/entry.ts";
+import { generateEntryId, formatTime, normalizeMemoryText, parseEntries, parseTime, serializeEntry } from "../src/entry.ts";
 import type { MemoryEntry } from "../src/types.ts";
 
 const entry: MemoryEntry = {
@@ -63,6 +63,36 @@ test("generateEntryId shape and formatTime/parseTime roundtrip", () => {
 	assert.equal(t, "2026-10-11 19:40:00");
 	assert.equal(parseTime(t), now.getTime());
 	assert.equal(parseTime("garbage"), 0);
+});
+
+test("seen/last roundtrip; absent for a never-reconfirmed entry", () => {
+	// seen === 1 leaves the original byte format alone.
+	assert.doesNotMatch(serializeEntry(entry), /seen:/);
+	const md = serializeEntry({ ...entry, seen: 4, last: "2026-10-24 09:00:00" });
+	assert.match(md, /\| seen: 4 \| last: 2026-10-24 09:00:00 -->/);
+	const parsed = parseEntries(md)[0]!;
+	assert.equal(parsed.seen, 4);
+	assert.equal(parsed.last, "2026-10-24 09:00:00");
+	assert.equal(parsed.text, entry.text);
+});
+
+test("supersedes / superseded-by roundtrip, invalid ids rejected", () => {
+	const md = serializeEntry({ ...entry, supersedes: ["20260101-abcd"], supersededBy: "20260202-ef01" });
+	assert.match(md, /\| supersedes: 20260101-abcd \| superseded-by: 20260202-ef01/);
+	const parsed = parseEntries(md)[0]!;
+	assert.deepEqual(parsed.supersedes, ["20260101-abcd"]);
+	assert.equal(parsed.supersededBy, "20260202-ef01");
+
+	const bad = parseEntries("<!-- mid: 20261011-a1b2 | t: 2026-10-11 19:40:00 | p: - | src: auto | tags: x | superseded-by: garbage -->\nbody\n\n")[0]!;
+	assert.equal(bad.supersededBy, undefined, "a malformed replacement id must not de-index the entry");
+	const selfRef = parseEntries("<!-- mid: 20261011-a1b2 | t: 2026-10-11 19:40:00 | p: - | src: auto | tags: x | supersedes: 20261011-a1b2 -->\nbody\n\n")[0]!;
+	assert.equal(selfRef.supersedes, undefined);
+});
+
+test("normalizeMemoryText ignores case/whitespace/trailing punctuation only", () => {
+	assert.equal(normalizeMemoryText("  Use   PostgreSQL.\n"), normalizeMemoryText("use postgresql"));
+	assert.notEqual(normalizeMemoryText("use postgresql"), normalizeMemoryText("use postgres"));
+	assert.notEqual(normalizeMemoryText("auth token in env"), normalizeMemoryText("token auth in env"));
 });
 
 test("malformed meta gets defaults, empty text dropped", () => {

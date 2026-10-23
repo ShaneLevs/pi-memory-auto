@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { DEFAULT_GLOBAL_DIR, INDEX_BUDGET } from "./constants.ts";
 import { CONSOLIDATE_EVERY_DEFAULT } from "./consolidate.ts";
+import { REVIEW_MONTHS_DEFAULT } from "./staleness.ts";
 import type { MemoryConfig } from "./types.ts";
 
 function envInt(env: NodeJS.ProcessEnv, name: string, fallback: number, min: number, max: number): number {
@@ -34,5 +35,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): MemoryConfig {
 		/** maxTokens for background LLM calls; large enough that extraction
 		 *  responses are never truncated (stopReason "length" is rejected). */
 		llmMaxTokens: envInt(env, "PI_MEMORY_AUTO_LLM_MAX_TOKENS", 10_000, 1024, 200_000),
+		/** Staleness override (months). Unset/0 = per-file defaults (staleness.ts);
+	 *  never negative from the environment, so a typo cannot silently disable it. */
+		reviewMonths: envInt(env, "PI_MEMORY_AUTO_REVIEW_MONTHS", REVIEW_MONTHS_DEFAULT, 0, 120),
 	};
 }

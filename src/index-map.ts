@@ -38,7 +38,12 @@ export interface LayerIndexOptions {
 	projectName?: string;
 	/** Print the layer header line (off for the MEMORY.md file body). */
 	header?: boolean;
+	/** Keyword recall counts, for ranking (see usage.ts). */
+	usage?: UsageMap;
 }
+
+/** Keyword key -> recall count from memory_search (usage.ts). */
+export type UsageMap = Record<string, number>;
 
 export interface KeywordRow {
 	/** Canonical matching key. */
@@ -59,6 +64,8 @@ export interface KeywordTable {
 	entryCount: number;
 	/** Memories that had no usable keyword and got a derived one. */
 	derived: number;
+	/** Memories replaced by a newer entry: on disk, but out of the index. */
+	superseded: number;
 }
 
 export interface LayerIndex {
@@ -92,16 +99,29 @@ export function entryKeywords(entry: MemoryEntry): { keywords: string[]; derived
 }
 
 /** Build the de-duplicated, ranked keyword table for one layer. */
-export function collectKeywords(entries: IndexInput[], layer: Layer, opts: { maxKeywords?: number } = {}): KeywordTable {
+export function collectKeywords(
+	entries: IndexInput[],
+	layer: Layer,
+	opts: { maxKeywords?: number; usage?: UsageMap } = {},
+): KeywordTable {
 	const cap = opts.maxKeywords ?? MAX_KEYWORDS_PER_LAYER;
+	const usage = opts.usage ?? {};
 	const byKey = new Map<string, KeywordRow>();
 	let entryCount = 0;
 	let derived = 0;
+	let superseded = 0;
 
 	for (const { entry, file } of entries) {
 		if (entry.layer !== layer) continue;
 		if (file.endsWith(`/${MAIN_FILE}`)) continue;
 		entryCount++;
+		// A replaced memory keeps its row and stays searchable, but its keywords
+		// must not occupy index slots that live memories need. This is the whole
+		// "forgetting" story for the index: stop advertising it, delete nothing.
+		if (entry.supersededBy) {
+			superseded++;
+			continue;
+		}
 
 		const { keywords, derived: isDerived } = entryKeywords(entry);
 		if (isDerived) derived++;
@@ -119,11 +139,22 @@ export function collectKeywords(entries: IndexInput[], layer: Layer, opts: { max
 	}
 
 	const rows = [...byKey.values()];
-	// Rank: most-shared keywords first, then alphabetical (stable + scannable).
-	rows.sort((a, b) => b.count - a.count || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+	// Rank: most-shared first, then keywords the agent has actually recalled
+	// with (usage.ts), then alphabetical (stable + scannable).
+	//
+	// Recalls are capped at 4 for ranking, so a keyword that is both shared by
+	// several memories and proven useful wins the budget, while one lucky search
+	// cannot promote a singleton over a keyword used by five memories.
+	const weight = (row: KeywordRow): number => row.count + Math.min(usage[row.key] ?? 0, 4);
+	rows.sort((a, b) => {
+		const diff = weight(b) - weight(a);
+		if (diff !== 0) return diff;
+		if (b.count !== a.count) return b.count - a.count;
+		return a.key < b.key ? -1 : a.key > b.key ? 1 : 0;
+	});
 	const total = rows.length;
 	const kept = rows.slice(0, cap);
-	return { rows: kept, total, dropped: total - kept.length, entryCount, derived };
+	return { rows: kept, total, dropped: total - kept.length, entryCount, derived, superseded };
 }
 
 function countSuffix(count: number): string {
@@ -133,6 +164,17 @@ function countSuffix(count: number): string {
 /**
  * Render a keyword table within `budget` characters.
  * `header` is prepended when provided (used for the injected block).
+ *
+ * Degrades in stages instead of cutting once (claude-mem's ContextBudget idea,
+ * at keyword granularity — a keyword is never half-written):
+ *
+ * 1. one line per keyword with its memory count;
+ * 2. the remaining keywords packed onto continuation lines WITHOUT counts
+ *    (a count costs 4 chars and is the least useful information in the table);
+ * 3. only past that is the rest collapsed into a "+N more" hint.
+ *
+ * Stage 2 roughly doubles the number of topics that fit a fixed budget, and the
+ * hint points at `keyword` search (a real lookup), not at `recent` (a listing).
  */
 export function renderKeywordTable(
 	rows: KeywordRow[],
@@ -142,6 +184,7 @@ export function renderKeywordTable(
 	const lines: string[] = [];
 	let used = opts.header ? opts.header.length : 0;
 	let shown = 0;
+
 	for (let i = 0; i < limit; i++) {
 		const row = rows[i]!;
 		const line = `#${row.display}${countSuffix(row.count)}`;
@@ -150,8 +193,23 @@ export function renderKeywordTable(
 		used += line.length + 1;
 		shown++;
 	}
+
+	// Stage 2: pack what is left without the counts.
+	let inline = "";
+	while (shown < limit) {
+		const item = `#${rows[shown]!.display}`;
+		const candidate = inline ? `${inline} ${item}` : item;
+		if (used + candidate.length + 1 > opts.budget) break;
+		inline = candidate;
+		shown++;
+	}
+	if (inline) {
+		lines.push(inline);
+		used += inline.length + 1;
+	}
+
 	const hidden = rows.length - shown;
-	if (hidden > 0) lines.push(`(+${hidden} more keywords — memory_search mode:"recent")`);
+	if (hidden > 0) lines.push(`(+${hidden} more — memory_search mode:"keyword")`);
 	const body = lines.join("\n");
 	const text = opts.header ? `${opts.header}\n${body}` : body;
 	return { text, shown, hidden };
@@ -159,7 +217,7 @@ export function renderKeywordTable(
 
 /** Build one layer's injected index section (header + keyword lines). */
 export function buildLayerIndex(entries: IndexInput[], layer: Layer, opts: LayerIndexOptions): LayerIndex {
-	const table = collectKeywords(entries, layer);
+	const table = collectKeywords(entries, layer, { ...(opts.usage ? { usage: opts.usage } : {}) });
 	if (table.entryCount === 0) return { text: "", hidden: 0, entryCount: 0, keywordCount: 0 };
 
 	const projectName = opts.projectName || entries.find((e) => e.entry.layer === "project")?.entry.project || "";
@@ -177,8 +235,8 @@ export function buildLayerIndex(entries: IndexInput[], layer: Layer, opts: Layer
 }
 
 /** Build both layer sections joined with a blank line (used by injection). */
-export function buildMemoryIndex(entries: IndexInput[], opts: LayerIndexOptions): string {
-	const global = buildLayerIndex(entries, "global", opts).text;
-	const project = buildLayerIndex(entries, "project", opts).text;
+export function buildMemoryIndex(entries: IndexInput[], opts: LayerIndexOptions & { usageByLayer?: { global?: UsageMap; project?: UsageMap } }): string {
+	const global = buildLayerIndex(entries, "global", { ...opts, ...(opts.usageByLayer?.global ? { usage: opts.usageByLayer.global } : {}) }).text;
+	const project = buildLayerIndex(entries, "project", { ...opts, ...(opts.usageByLayer?.project ? { usage: opts.usageByLayer.project } : {}) }).text;
 	return [global, project].filter(Boolean).join("\n\n");
 }

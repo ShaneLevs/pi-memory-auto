@@ -1,7 +1,15 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { formatSearchResult, searchEntries, tokenize } from "../src/search.ts";
-import type { MemoryEntry } from "../src/types.ts";
+import { formatSearchResult, searchEntries as searchEntriesAt, tokenize } from "../src/search.ts";
+import type { LoadedEntry } from "../src/search.ts";
+import type { MemoryEntry, SearchMode } from "../src/types.ts";
+
+/** Every search in this file runs on a fixed clock, so the staleness feature
+ *  (staleness.ts) cannot make these fixtures expire years after they were written. */
+const NOW = Date.parse("2026-04-01T00:00:00");
+function searchEntries(all: LoadedEntry[], mode: SearchMode, query: string, page: number, pageSize: number, opts: { reviewMonths?: number } = {}) {
+	return searchEntriesAt(all, mode, query, page, pageSize, { now: NOW, ...opts });
+}
 
 function mk(id: string, time: string, text: string, tags: string[] = []): { entry: MemoryEntry; file: string } {
 	return {
@@ -109,4 +117,18 @@ test("formatSearchResult includes metadata and pagination hint", () => {
 test("formatSearchResult handles an empty store", () => {
 	const text = formatSearchResult(searchEntries([], "keyword", "zzz", 1, 10), "keyword", "zzz");
 	assert.match(text, /No memories stored yet/);
+});
+
+test("superseded entries never outrank a live memory and are labeled", () => {
+	const live = mk("20261002-bbbb", "2026-10-02 10:00:00", "Use PostgreSQL for JSON support", ["db"]);
+	const dead: { entry: MemoryEntry; file: string } = {
+		...mk("20261001-aaaa", "2026-10-01 10:00:00", "Use MySQL for the store", ["db"]),
+		entry: { ...mk("20261001-aaaa", "2026-10-01 10:00:00", "Use MySQL for the store", ["db"]).entry, supersededBy: live.entry.id },
+	};
+	const r = searchEntries([dead, live], "tag", "db", 1, 10);
+	assert.equal(r.hits.length, 2);
+	assert.equal(r.hits[0]!.entry.id, live.entry.id);
+	assert.equal(r.hits[1]!.entry.id, dead.entry.id, "still retrievable");
+	const text = formatSearchResult(r, "tag", "db");
+	assert.match(text, /superseded by \[20261002-bbbb\]/);
 });

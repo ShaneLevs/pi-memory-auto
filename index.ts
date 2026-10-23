@@ -20,17 +20,19 @@ import { Type } from "typebox";
 import { loadConfig } from "./src/config.ts";
 import { CONSOLIDATION_TIMEOUT_MS, runConsolidation } from "./src/consolidate.ts";
 import { CLASSIFICATION_RUBRIC, EXISTING_MEMORIES_MAX_CHARS, INJECTION_PREAMBLE, LLM_TIMEOUT_MS, MAIN_FILE, WRITABLE_FILES } from "./src/constants.ts";
-import { isTrivialSession, runReview, serializeTranscript } from "./src/extractor.ts";
+import { isTrivialSession, MAX_SUPERSEDES, runReview, serializeTranscript } from "./src/extractor.ts";
 import { runHandoff } from "./src/handoff.ts";
 import { materializeAll, type LayerStats } from "./src/indexer.ts";
 import { findTruncationSignal } from "./src/integrity.ts";
 import { MAX_KEYWORDS, sanitizeKeywords } from "./src/keywords.ts";
 import { buildMemoryReport } from "./src/report.ts";
+import { MEMORY_USAGE, layerLabel, parseMemoryArgs } from "./src/command.ts";
 import { runKeywordRekey } from "./src/rekey.ts";
 import { formatSearchResult, loadAllEntries, searchEntries } from "./src/search.ts";
 import { SnapshotManager } from "./src/snapshot.ts";
 import { FileMutex, ProcessLock, appendEntry, isWritableTarget } from "./src/store.ts";
 import { countTurnsFromBranch } from "./src/turns.ts";
+import { loadUsage, recalledByLayer, recordRecalls } from "./src/usage.ts";
 import type { Layer, SearchMode } from "./src/types.ts";
 
 export default function piMemoryAuto(pi: ExtensionAPI) {
@@ -68,6 +70,20 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 		maybeConsolidate(ctx, stats);
 	}
 
+	/**
+	 * Write the keyword tables and wait for them, WITHOUT waiting for the
+	 * (background, LLM-based) consolidation.
+	 *
+	 * Called on every write path so that "the memory was saved" always implies
+	 * "its keyword is on disk in MEMORY.md" by the time the caller continues —
+	 * MEMORY.md is program-owned state that is never read back at injection time,
+	 * so a stale file is only cosmetic, but it should never exist.
+	 */
+	async function syncIndexesNow(ctx?: ExtensionContext): Promise<void> {
+		const stats = await materializeAll(indexDeps());
+		if (ctx) maybeConsolidate(ctx, stats);
+	}
+
 	function maybeConsolidate(ctx: ExtensionContext, stats: { global: LayerStats; project: LayerStats }): void {
 		if (consolidationInFlight) return;
 		const due = (["global", "project"] as const).filter(
@@ -79,14 +95,18 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 		for (const layer of due) attemptedAt[layer] = stats[layer].sinceLast;
 
 		consolidationInFlight = true;
+		// Only the layers that are actually due are sent, and only their files are
+		// rewritten: a project accumulating memories must not drag the user's
+		// global store through another merge round.
 		void loadAllEntries(config.globalDir, projectRoot)
-			.then((entries) => runConsolidation(writeDeps(), entries, model, registry, CONSOLIDATION_TIMEOUT_MS))
+			.then((entries) => runConsolidation(writeDeps(), entries, model, registry, CONSOLIDATION_TIMEOUT_MS, due))
 			.then(async (result) => {
 				if (result.noop) return;
 				// Merges shrink the entry count, so reset the watermark explicitly.
-				await refreshIndexes(ctx, { resetCounter: true });
+				await materializeAll(indexDeps(), { resetCounter: true, layers: due });
+				for (const layer of due) attemptedAt[layer] = 0;
 				if (ctx.hasUI) {
-					ctx.ui.notify(`memory-auto: consolidated ${result.removed} merged memories`, "info");
+					ctx.ui.notify(`memory-auto: consolidated ${result.removed} merged memories (${due.map(layerLabel).join(", ")})`, "info");
 				}
 			})
 			.catch(() => undefined)
@@ -104,8 +124,12 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 		for (const { entry, file } of sorted) {
 			const text = entry.text.trim();
 			if (!text) continue;
+			// The id is what lets the review name a memory in SUPERSEDES. Superseded
+			// entries are listed too — otherwise the model re-writes a fact that was
+			// already corrected.
 			const tags = entry.tags.length > 0 ? ` #${entry.tags.join(" #")}` : "";
-			const line = `- [${file}]${tags} ${text}`;
+			const dead = entry.supersededBy ? ` (superseded by ${entry.supersededBy})` : "";
+			const line = `- [${entry.id}] [${file}]${tags}${dead} ${text}`;
 			if (total + line.length > EXISTING_MEMORIES_MAX_CHARS) break;
 			lines.push(line);
 			total += line.length;
@@ -152,6 +176,9 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 			"- all (fused): keyword + tag + a stronger recency term. Good first try for exploratory questions.",
 			"- id: exact entry id, for \"show me that entry again\".",
 			"Results are paginated (page size 10) — follow page=N when hasMore. Never guess memory contents — search instead.",
+			"Reading results:",
+			"- An entry marked `superseded by [id]` was replaced: read that entry instead.",
+			"- An entry marked `stale (Nd, interval Nmo)` is past its review interval. It is still returned, but verify it against the current repo/code before relying on it — if it is wrong, write the corrected memory with supersedes:[that id].",
 		].join("\n"),
 		parameters: Type.Object({
 			query: Type.Optional(Type.String({ description: "Search query: keywords, tags, or an entry id depending on mode." })),
@@ -163,8 +190,22 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 			const mode: SearchMode = params.mode ?? "keyword";
 			const page = Math.max(1, Math.floor(params.page ?? 1));
 			const all = await loadAllEntries(config.globalDir, projectRoot);
-			const result = searchEntries(all, mode, params.query ?? "", page, config.pageSize);
+			const result = searchEntries(all, mode, params.query ?? "", page, config.pageSize, { reviewMonths: config.reviewMonths });
 			const text = formatSearchResult(result, mode, params.query ?? "");
+			// Read/write loop (usage.ts): credit the keywords that actually found
+			// something, so the next session's index ranks by usefulness, not only by
+			// how many memories happen to share a keyword. Only page 1 is credited —
+			// deeper pages re-read a hit that was already credited.
+			if (page === 1) {
+				try {
+					const credited = recalledByLayer(result, mode);
+					const deps = { globalDir: config.globalDir, projectRoot, mutex };
+					await recordRecalls("global", credited.global, deps);
+					await recordRecalls("project", credited.project, deps);
+				} catch {
+					// A broken usage log must never break a search.
+				}
+			}
 			return {
 				content: [{ type: "text" as const, text }],
 				details: { summary: `${result.hits.length}/${result.total} memories`, mode, page, total: result.total, fallback: result.fallback },
@@ -183,7 +224,8 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 			CLASSIFICATION_RUBRIC,
 			"Notes:",
 			"- You cannot write the index file (MEMORY.md); it is generated from the entries.",
-			"- Before writing, use memory_search to check for duplicates; do not re-store equivalent entries.",
+			"- Before writing, use memory_search to check for duplicates; do not re-store equivalent entries. Writing a body that already exists is a no-op: it increments the stored entry's confirmation count instead of adding a duplicate row.",
+			"- Use `supersedes` for a CORRECTION, not an addition: pass the id of the memory that is now wrong and write the corrected text. The old entry is kept on disk but stops being injected and ranks below the new one — nothing is deleted, so this is always safe.",
 			"- Never store secrets, API keys, or tokens.",
 		].join("\n"),
 		parameters: Type.Object({
@@ -195,6 +237,13 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 				maxItems: MAX_KEYWORDS,
 				description: "1-3 retrieval keywords: what a future session would search for. Bilingual when the languages differ.",
 			}),
+			supersedes: Type.Optional(
+				Type.Array(Type.String(), {
+					maxItems: MAX_SUPERSEDES,
+					description:
+						"Ids of stored memories this entry replaces (a correction, not a duplicate). The replaced entries are kept on disk but leave the injected index and rank below this one.",
+				}),
+			),
 		}),
 		execute: async (_id, params) => {
 			const layer = params.layer as Layer;
@@ -231,19 +280,42 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 					isError: true,
 				};
 			}
-			const entry = await appendEntry({ layer, file: params.file as never }, params.text, {
+			const outcome = await appendEntry({ layer, file: params.file as never }, params.text, {
 				tags: keywords,
 				source: "user",
 				globalDir: config.globalDir,
 				projectRoot,
 				mutex,
 				plock: new ProcessLock(config.globalDir),
+				...(params.supersedes && params.supersedes.length > 0 ? { supersedes: params.supersedes } : {}),
 			});
-			if (ctxRef) void refreshIndexes(ctxRef);
-			else void materializeAll(indexDeps());
+			const entry = outcome.entry;
+			const replacedCount = outcome.superseded;
+			const replaced = replacedCount > 0 ? `replaced ${replacedCount} ${replacedCount === 1 ? "memory" : "memories"}` : "";
+			if (outcome.deduped) {
+				// Nothing was appended, so the keyword table only changed if this write
+				// ALSO superseded entries (they drop out of the index).
+				if (replacedCount > 0) {
+					if (ctxRef) await syncIndexesNow(ctxRef);
+					else await syncIndexesNow();
+				}
+				const also = replaced ? ` It also ${replaced}.` : "";
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: `Already stored in ${outcome.file} [${entry.id}] — this write was folded into it (seen ×${entry.seen ?? 1}, last ${entry.last ?? entry.time}); no duplicate row was added.${also} If the stored wording is wrong, write the corrected memory and pass supersedes:["${entry.id}"].`,
+						},
+					],
+					details: { summary: `already stored in ${outcome.file}`, entryId: entry.id, deduped: true } as { summary: string; entryId?: string; deduped?: boolean },
+				};
+			}
+			if (ctxRef) await syncIndexesNow(ctxRef);
+			else await syncIndexesNow();
+			const replacedNote = replaced ? ` · ${replaced}` : "";
 			return {
-				content: [{ type: "text" as const, text: `Saved to ${layer}/${params.file}.md [${entry.id}] ${entry.time} keywords: ${entry.tags.join(",")}` }],
-				details: { summary: `saved ${layer}/${params.file}.md`, entryId: entry.id } as { summary: string; entryId?: string },
+				content: [{ type: "text" as const, text: `Saved to ${outcome.file} [${entry.id}] ${entry.time} keywords: ${entry.tags.join(",")}${replacedNote}` }],
+				details: { summary: `saved ${outcome.file}`, entryId: entry.id, deduped: false } as { summary: string; entryId?: string; deduped?: boolean },
 			};
 		},
 	});
@@ -257,53 +329,83 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 	}
 
 	const MEMORY_SUBS = [
-		{ value: "show", label: "show", description: "Print the keyword index and consolidation watermark" },
-		{ value: "compact", label: "compact", description: "Merge duplicate memories now, regardless of the threshold" },
-		{ value: "rebuild", label: "rebuild", description: "Re-derive every memory's keywords with the model, then regenerate MEMORY.md" },
+		{ value: "show", label: "show", description: "Print both layers' keyword index and consolidation watermark" },
+		{ value: "compact project", label: "compact project", description: "Merge duplicate memories in this project's layer" },
+		{ value: "compact user", label: "compact user", description: "Merge duplicate memories in the user (global) layer" },
+		{ value: "rebuild project", label: "rebuild project", description: "Re-derive this project's keywords with the model, then its index" },
+		{ value: "rebuild user", label: "rebuild user", description: "Re-derive the user (global) keywords with the model, then its index" },
 	];
 
 	pi.registerCommand("memory", {
-		description: "Show the memory keyword index; 'compact' merges duplicates now; 'rebuild' re-derives keywords and regenerates MEMORY.md",
+		description: "Keyword index; compact|rebuild <project|user> act on ONE layer only",
 		getArgumentCompletions: (prefix) => MEMORY_SUBS.filter((s) => s.value.startsWith(prefix.trim().toLowerCase())),
 		handler: async (args, ctx) => {
 			syncProject(ctx);
-			const sub = (args.trim().split(/\s+/)[0] ?? "").toLowerCase();
+			const cmd = parseMemoryArgs(args);
 
-			if (sub === "rebuild") {
+			if (cmd.kind === "unknown") {
+				ctx.ui.notify(`memory: unknown argument "${cmd.arg}"\n${MEMORY_USAGE}`, "warning");
+				return;
+			}
+
+			if (cmd.kind === "help") {
+				ctx.ui.notify(MEMORY_USAGE, "info");
+				return;
+			}
+
+			if (cmd.kind === "rebuild") {
+				// Both commands are layer-scoped: running a project command must not
+				// rewrite the user's shared store, or every project would redo the same
+				// global work. A missing layer is a usage error, never a "do both".
+				if (!cmd.layer) {
+					ctx.ui.notify(`memory: rebuild needs a layer\n${MEMORY_USAGE}`, "warning");
+					return;
+				}
+				const layer = cmd.layer;
+				const label = layerLabel(layer);
 				// The index is the only memory content in context, so a rebuild
-				// re-derives every entry's keywords with the session model rather
-				// than just re-rendering the stored ones. Without a session model the
-				// same pass still repairs malformed tags deterministically and
-				// persists that repair, so the store heals either way.
-				const entries = await loadAllEntries(config.globalDir, projectRoot);
+				// re-derives that layer's keywords with the session model rather than
+				// just re-rendering the stored ones. Without a session model the same
+				// pass still repairs malformed tags deterministically, so the store
+				// heals either way.
+				const all = await loadAllEntries(config.globalDir, projectRoot);
+				const entries = all.filter(({ entry }) => entry.layer === layer);
 				const { model, registry } = modelInfo(ctx);
 				const withModel = Boolean(model && registry);
 				let summary = "";
 				if (entries.length > 0) {
-					if (withModel) ctx.ui.notify(`memory: re-extracting keywords for ${entries.length} ${entries.length === 1 ? "memory" : "memories"}…`, "info");
+					if (withModel) ctx.ui.notify(`memory: re-extracting ${label} keywords for ${entries.length} ${entries.length === 1 ? "memory" : "memories"}…`, "info");
 					try {
 						const rekeyed = await runKeywordRekey(writeDeps(), entries, model, registry, {
-							onProgress: (done, all) => {
-								if (ctx.hasUI && done < all) ctx.ui.notify(`memory: keywords ${done}/${all}…`, "info");
+							onProgress: (done, total) => {
+								if (ctx.hasUI && done < total) ctx.ui.notify(`memory: ${label} keywords ${done}/${total}…`, "info");
 							},
 						});
 						summary = withModel
 							? ` · keywords re-derived: ${rekeyed.updated} changed, ${rekeyed.agreed} already good, ${rekeyed.unchanged} kept`
 							: ` · no session model: repaired ${rekeyed.updated} malformed keyword list${rekeyed.updated === 1 ? "" : "s"} only`;
 					} catch (error) {
-						ctx.ui.notify(`memory: keyword re-extraction failed — ${error instanceof Error ? error.message : String(error)}`, "error");
+						ctx.ui.notify(`memory: ${label} keyword re-extraction failed — ${error instanceof Error ? error.message : String(error)}`, "error");
 					}
+				} else {
+					summary = " · nothing stored in this layer";
 				}
-				const stats = await materializeAll(indexDeps());
-				const ok = [stats.global, stats.project].some((s) => s.written);
+				const stats = await materializeAll(indexDeps(), { layers: [layer] });
+				const s = stats[layer];
 				ctx.ui.notify(
-					`memory: index ${ok ? "rebuilt" : "already current"} — global ${stats.global.entries}/${stats.global.keywords}, project ${stats.project.entries}/${stats.project.keywords}${summary}`,
+					`memory: ${label} index ${s.written ? "rebuilt" : "already current"} — ${s.entries} memories / ${s.keywords} keywords${summary}`,
 					"info",
 				);
 				return;
 			}
 
-			if (sub === "compact") {
+			if (cmd.kind === "compact") {
+				if (!cmd.layer) {
+					ctx.ui.notify(`memory: compact needs a layer\n${MEMORY_USAGE}`, "warning");
+					return;
+				}
+				const layer = cmd.layer;
+				const label = layerLabel(layer);
 				const { model, registry } = modelInfo(ctx);
 				if (!model || !registry) {
 					ctx.ui.notify("memory: no session model available, cannot consolidate", "error");
@@ -313,41 +415,41 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 					ctx.ui.notify("memory: a consolidation round is already running", "warning");
 					return;
 				}
-				ctx.ui.notify("memory: consolidating…", "info");
 				consolidationInFlight = true;
 				try {
-					const entries = await loadAllEntries(config.globalDir, projectRoot);
-					const result = await runConsolidation(writeDeps(), entries, model, registry, CONSOLIDATION_TIMEOUT_MS);
-					if (result.noop) {
-						// Nothing merged: keep the watermark, but don't re-run on the next write.
-						const stats = await materializeAll(indexDeps());
-						attemptedAt.global = stats.global.sinceLast;
-						attemptedAt.project = stats.project.sinceLast;
-						ctx.ui.notify(`memory: nothing to merge (${entries.length} memories)`, "info");
+					const all = await loadAllEntries(config.globalDir, projectRoot);
+					const entries = all.filter(({ entry }) => entry.layer === layer);
+					if (entries.length < 2) {
+						ctx.ui.notify(`memory: nothing to merge — ${label} layer holds ${entries.length} memory`, "info");
 						return;
 					}
-					const stats = await materializeAll(indexDeps(), { resetCounter: true });
-					attemptedAt.global = 0;
-					attemptedAt.project = 0;
+					ctx.ui.notify(`memory: consolidating ${label} (${entries.length} memories)…`, "info");
+					const result = await runConsolidation(writeDeps(), entries, model, registry, CONSOLIDATION_TIMEOUT_MS, [layer]);
+					if (result.noop) {
+						// Nothing merged: keep the watermark, but don't re-run on the next write.
+						const stats = await materializeAll(indexDeps(), { layers: [layer] });
+						attemptedAt[layer] = stats[layer].sinceLast;
+						ctx.ui.notify(`memory: nothing to merge in ${label} (${entries.length} memories)`, "info");
+						return;
+					}
+					const stats = await materializeAll(indexDeps(), { resetCounter: true, layers: [layer] });
+					attemptedAt[layer] = 0;
+					const s = stats[layer];
 					ctx.ui.notify(
-						`memory: merged ${result.removed} ${result.removed === 1 ? "memory" : "memories"} across ${result.changedFiles} ${result.changedFiles === 1 ? "file" : "files"} — now global ${stats.global.entries}/${stats.global.keywords}, project ${stats.project.entries}/${stats.project.keywords}`,
+						`memory: ${label} merged ${result.removed} ${result.removed === 1 ? "memory" : "memories"} across ${result.changedFiles} ${result.changedFiles === 1 ? "file" : "files"} — now ${s.entries} memories / ${s.keywords} keywords`,
 						"info",
 					);
 				} catch (error) {
-					ctx.ui.notify(`memory: consolidation failed — ${error instanceof Error ? error.message : String(error)}`, "error");
+					ctx.ui.notify(`memory: ${label} consolidation failed — ${error instanceof Error ? error.message : String(error)}`, "error");
 				} finally {
 					consolidationInFlight = false;
 				}
 				return;
 			}
 
-			if (sub !== "" && sub !== "show") {
-				ctx.ui.notify(`memory: unknown argument "${sub}" — use show, compact or rebuild`, "warning");
-				return;
-			}
-
 			const stats = await materializeAll(indexDeps());
 			const entries = await loadAllEntries(config.globalDir, projectRoot);
+			const usage = await loadUsage(config.globalDir, projectRoot).catch(() => ({ global: {}, project: {} }));
 			const report = buildMemoryReport(entries, {
 				globalDir: config.globalDir,
 				projectRoot,
@@ -355,6 +457,8 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 				threshold: config.consolidateEvery,
 				global: stats.global,
 				project: stats.project,
+				usage,
+				reviewMonths: config.reviewMonths,
 			});
 			pi.sendMessage({ customType: "memory-auto.report", content: report, display: true });
 		},
@@ -411,8 +515,8 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 			// nothing to do with the budget.
 			const transcript = serializeTranscript([...event.preparation.messagesToSummarize]);
 			void runHandoff(writeDeps(), transcript, model, registry)
-				.then((written) => {
-					if (written.length > 0) void refreshIndexes(ctx);
+				.then(async (written) => {
+					if (written.length > 0) await syncIndexesNow(ctx);
 				})
 				.catch(() => undefined);
 		}

@@ -18,14 +18,24 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { MAIN_FILE } from "./constants.ts";
-import { collectKeywords, renderKeywordTable, type IndexInput } from "./index-map.ts";
+import { collectKeywords, renderKeywordTable, type IndexInput, type UsageMap } from "./index-map.ts";
 import { loadAllEntries } from "./search.ts";
+import { usagePath, parseUsage } from "./usage.ts";
 import { FileMutex, mainFilePath, readFileOrEmpty } from "./store.ts";
 import type { Layer } from "./types.ts";
 
+/** Read one layer's keyword usage log (missing/corrupt reads as {}). */
+async function loadLayerUsage(layer: Layer, globalDir: string, projectRoot: string): Promise<UsageMap> {
+	try {
+		return parseUsage(await fs.readFile(usagePath(layer, globalDir, projectRoot), "utf8"));
+	} catch {
+		return {};
+	}
+}
+
 /** Banner written at the top of every generated MEMORY.md. */
 export const INDEX_BANNER =
-	"<!-- AUTO-GENERATED keyword table for this layer — one line per unique keyword. Rebuilt from the category files in this directory; edits are overwritten. -->";
+	"<!-- AUTO-GENERATED — do not edit. This file is owned entirely by the extension: it is rewritten on every memory write, rebuild and consolidation. The source of truth is the category files in this directory; the memory bodies are never inlined here. -->";
 
 const STATS_RE = /<!--\s*stats:\s*entries=(\d+)\s+keywords=(\d+)\s+sinceLast=(\d+)\s+lastConsolidated=(\S+)\s*-->/;
 
@@ -62,8 +72,13 @@ export function parseStats(raw: string): Omit<LayerStats, "written"> {
 }
 
 /** Render the full MEMORY.md content for a layer (banner + stats + keywords). */
-export function renderIndexFile(entries: IndexInput[], layer: Layer, stats: Omit<LayerStats, "written">): string {
-	const table = collectKeywords(entries, layer);
+export function renderIndexFile(
+	entries: IndexInput[],
+	layer: Layer,
+	stats: Omit<LayerStats, "written">,
+	usage: UsageMap = {},
+): string {
+	const table = collectKeywords(entries, layer, { usage });
 	if (table.entryCount === 0) return "";
 	const { text } = renderKeywordTable(table.rows, { budget: Number.MAX_SAFE_INTEGER });
 	const statsLine = `<!-- stats: entries=${table.entryCount} keywords=${table.total} sinceLast=${stats.sinceLast} lastConsolidated=${stats.lastConsolidated} -->`;
@@ -79,13 +94,14 @@ export async function materializeLayer(
 	deps: MaterializeDeps,
 	layer: Layer,
 	entries: IndexInput[],
-	opts: { resetCounter?: boolean } = {},
+	opts: { resetCounter?: boolean; usage?: UsageMap } = {},
 ): Promise<LayerStats> {
 	const filePath = mainFilePath(layer, deps.globalDir, deps.projectRoot);
 	return deps.mutex.run(filePath, async () => {
 		const existing = await readFileOrEmpty(filePath);
 		const previous = parseStats(existing);
-		const table = collectKeywords(entries, layer);
+		const usage = opts.usage ?? (await loadLayerUsage(layer, deps.globalDir, deps.projectRoot));
+		const table = collectKeywords(entries, layer, { usage });
 		const entriesNow = table.entryCount;
 
 		if (entriesNow === 0) {
@@ -100,7 +116,7 @@ export async function materializeLayer(
 		const lastConsolidated = opts.resetCounter ? new Date().toISOString() : previous.lastConsolidated;
 		const nextStats = { entries: entriesNow, keywords: table.total, sinceLast, lastConsolidated };
 
-		const content = renderIndexFile(entries, layer, nextStats);
+		const content = renderIndexFile(entries, layer, nextStats, usage);
 		if (existing === content) return { ...nextStats, written: false };
 		await fs.mkdir(path.dirname(filePath), { recursive: true });
 		await fs.writeFile(filePath, content, "utf8");
@@ -108,16 +124,22 @@ export async function materializeLayer(
 	});
 }
 
-/** Rebuild both layers from one scan of the entries. Never throws. */
+/**
+ * Rebuild the keyword table(s) from one scan of the entries. Never throws.
+ *
+ * `opts.layers` limits which MEMORY.md files are written, so a project-scoped
+ * command cannot touch the user's global index file.
+ */
 export async function materializeAll(
 	deps: MaterializeDeps,
-	opts: { resetCounter?: boolean } = {},
+	opts: { resetCounter?: boolean; layers?: readonly Layer[] } = {},
 ): Promise<{ global: LayerStats; project: LayerStats }> {
 	const empty: LayerStats = { entries: 0, keywords: 0, sinceLast: 0, lastConsolidated: "-", written: false };
+	const layers = opts.layers ?? (["global", "project"] as const);
 	try {
 		const entries = await loadAllEntries(deps.globalDir, deps.projectRoot);
-		const global = await materializeLayer(deps, "global", entries, opts);
-		const project = await materializeLayer(deps, "project", entries, opts);
+		const global = layers.includes("global") ? await materializeLayer(deps, "global", entries, opts) : empty;
+		const project = layers.includes("project") ? await materializeLayer(deps, "project", entries, opts) : empty;
 		return { global, project };
 	} catch {
 		return { global: empty, project: empty };

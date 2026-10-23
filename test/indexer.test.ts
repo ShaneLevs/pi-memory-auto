@@ -35,7 +35,7 @@ test("MEMORY.md is created from entries alone and carries stats", async () => {
 	assert.equal(stats.written, true);
 
 	const raw = await fs.readFile(path.join(dirs.projectRoot, ".pi/agent/memory-auto/MEMORY.md"), "utf8");
-	assert.match(raw, /AUTO-GENERATED keyword table/);
+	assert.match(raw, /AUTO-GENERATED — do not edit/);
 	assert.match(raw, /<!-- stats: entries=1 keywords=2 sinceLast=0/);
 	assert.match(raw, /#pnpm/);
 	assert.match(raw, /#deploy/);
@@ -91,4 +91,20 @@ test("rebuild is idempotent (no rewrite when content is unchanged)", async () =>
 	await materializeAll(deps(dirs));
 	const second = await materializeAll(deps(dirs));
 	assert.equal(second.project.written, false);
+});
+
+test("materializeAll can be scoped to one layer (no cross-layer file writes)", async () => {
+	const dirs = await setup();
+	await writeCategory(dirs.projectRoot, "DECISIONS.md", `${meta("20261001-aaaa", "pnpm", "proj")}\nUse pnpm.\n`);
+	await fs.mkdir(dirs.globalDir, { recursive: true });
+	await fs.writeFile(path.join(dirs.globalDir, "LESSONS.md"), `${meta("20261002-bbbb", "svg", "")}\nglobal body\n`, "utf8");
+	const globalMain = path.join(dirs.globalDir, "MEMORY.md");
+	const projectMain = path.join(dirs.projectRoot, ".pi/agent/memory-auto/MEMORY.md");
+
+	const stats = await materializeAll({ ...deps(dirs) }, { layers: ["project"] });
+	assert.equal(stats.project.entries, 1);
+	assert.equal(stats.global.entries, 0); // not scanned for writing
+	assert.equal(stats.global.written, false);
+	assert.match(await fs.readFile(projectMain, "utf8"), /#pnpm/);
+	await assert.rejects(fs.stat(globalMain), "global MEMORY.md must not be created");
 });

@@ -17,7 +17,10 @@ const stats = (over: Partial<ReportLayerStats> = {}): ReportLayerStats => ({
 	...over,
 });
 
-const base = { globalDir: "/g", projectRoot: "/p", threshold: 20, global: stats(), project: stats() };
+/** Fixed clock: the report now includes staleness (staleness.ts), so fixtures
+ *  must not age into "stale" years after this file was written. */
+const NOW = Date.parse("2026-10-12T00:00:00");
+const base = { globalDir: "/g", projectRoot: "/p", threshold: 20, global: stats(), project: stats(), now: NOW };
 
 test("wrapKeywords indents and wraps without exceeding the width", () => {
 	const out = wrapKeywords(["#aaaa", "#bbbb", "#cccc", "#dddd"], 20);
@@ -59,4 +62,26 @@ test("caps beyond 200 keywords are surfaced", () => {
 	const entries = Array.from({ length: 205 }, (_, i) => mk(`2026100${i % 9}-aa${String(i).padStart(2, "0")}`, [`kw${i}`], `x${i}`));
 	const text = buildMemoryReport(entries, base);
 	assert.match(text, /5 over the 200-keyword cap/);
+});
+
+test("superseded entries are surfaced as a health counter", () => {
+	const live = mk("20261002-bbbb", ["postgres"], "use postgres");
+	const dead: IndexInput = {
+		...mk("20261001-aaaa", ["mysql"], "use mysql"),
+		entry: { ...mk("20261001-aaaa", ["mysql"], "use mysql").entry, supersededBy: live.entry.id },
+	};
+	const text = buildMemoryReport([live, dead], base);
+	assert.match(text, /health: 1 superseded \(kept on disk, out of the index\)/);
+	assert.doesNotMatch(text, /#mysql/);
+});
+
+test("near-duplicate pairs are listed with an actionable command", () => {
+	const entries = [
+		mk("20261001-aaaa", ["deploy", "rsync"], "Deploy goes through rsync to the staging host."),
+		mk("20261002-bbbb", ["deploy", "rsync"], "Deploy uses rsync to reach the staging host."),
+	];
+	const text = buildMemoryReport(entries, base);
+	assert.match(text, /merge candidates \(1\) — \/memory compact project:/);
+	assert.match(text, /\[20261001-aaaa\] ↔ \[20261002-bbbb\]/);
+	assert.match(text, /shared: deploy, rsync/);
 });

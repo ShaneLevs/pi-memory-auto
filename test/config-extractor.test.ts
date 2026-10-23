@@ -78,6 +78,32 @@ test("parseReviewResponse: NOTHING_TO_SAVE only", () => {
 	assert.equal(parseReviewResponse("", "p").length, 0);
 });
 
+test("parseReviewResponse: SUPERSEDES ids are shape-checked and capped", () => {
+	const response = `===ENTRY===
+FILE: DECISIONS.md
+LAYER: project
+TAGS: db
+SUPERSEDES: 20261011-a1b2, not-an-id, 20261012-b3c4, 20261013-d5e6
+TEXT: Use MySQL after all.
+
+===ENTRY===
+FILE: TOOLING.md
+LAYER: global
+TAGS: bun
+SUPERSEDES: -
+TEXT: Shane prefers bun.`;
+	const parsed = parseReviewResponse(response, "proj");
+	assert.equal(parsed.length, 2);
+	// Garbage dropped, only the first MAX_SUPERSEDES kept.
+	assert.deepEqual(parsed[0]!.supersedes, ["20261011-a1b2", "20261012-b3c4"]);
+	assert.deepEqual(parsed[1]!.supersedes, []);
+});
+
+test("review prompt teaches SUPERSEDES and keeps the id in the digest contract", () => {
+	assert.match(REVIEW_SYSTEM_PROMPT, /SUPERSEDES: <ids of existing memories/);
+	assert.match(REVIEW_SYSTEM_PROMPT, /nothing is deleted/);
+});
+
 test("trivial session gate", () => {
 	assert.equal(isTrivialSession(2), true);
 	assert.equal(isTrivialSession(4), false);
