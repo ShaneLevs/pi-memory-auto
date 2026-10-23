@@ -16,7 +16,7 @@
  */
 
 import { MAIN_FILE } from "./constants.ts";
-import { MAX_KEYWORDS, MAX_KEYWORDS_PER_LAYER, deriveKeyword, keywordDisplay, keywordKey } from "./keywords.ts";
+import { MAX_KEYWORDS, MAX_KEYWORDS_PER_LAYER, coerceKeywords, keywordDisplay, keywordKey } from "./keywords.ts";
 
 export { MAX_KEYWORDS_PER_LAYER };
 import type { Layer, MemoryEntry } from "./types.ts";
@@ -71,22 +71,24 @@ export interface LayerIndex {
 
 /**
  * Keywords used by one entry, normalized.
- * Legacy entries without tags get a keyword derived from their text (never
- * zero keywords), so every memory stays reachable from the index.
+ *
+ * Stored tag fields are repaired first (see coerceKeywords), so legacy entries
+ * whose tags were space-separated contribute their individual keywords instead
+ * of one unsearchable blob, and entries without any usable keyword get one
+ * derived from the text — the index never loses reachability.
  */
 export function entryKeywords(entry: MemoryEntry): { keywords: string[]; derived: boolean } {
-	const keywords: string[] = [];
+	const { keywords, derived } = coerceKeywords(entry.tags, entry.text);
+	const out: string[] = [];
 	const seen = new Set<string>();
-	for (const tag of entry.tags) {
-		const key = keywordKey(tag);
+	for (const keyword of keywords) {
+		const key = keywordKey(keyword);
 		if (!key || seen.has(key)) continue;
 		seen.add(key);
-		keywords.push(keywordDisplay(tag));
+		out.push(keywordDisplay(keyword));
+		if (out.length >= MAX_KEYWORDS) break;
 	}
-	// Rule: at most 3 keywords per memory. Legacy entries may carry more; the
-	// first ones are the intended ones, and the rest stay searchable by text.
-	if (keywords.length > 0) return { keywords: keywords.slice(0, MAX_KEYWORDS), derived: false };
-	return { keywords: [deriveKeyword(entry.text)], derived: true };
+	return { keywords: out, derived };
 }
 
 /** Build the de-duplicated, ranked keyword table for one layer. */

@@ -5,7 +5,7 @@
 
 import fs from "node:fs/promises";
 import path from "node:path";
-import { ENTRY_META_PREFIX, MAIN_FILE, PROJECT_DIR, WRITABLE_FILES, WRITE_DEBOUNCE_MS } from "./constants.ts";
+import { ENTRY_META_PREFIX, MAIN_FILE, PROJECT_DIR, WRITABLE_FILES } from "./constants.ts";
 import { generateEntryId, formatTime, parseEntries, serializeEntry } from "./entry.ts";
 import { keywordKey } from "./keywords.ts";
 import type { CategoryFile, Layer, MemoryEntry, MemorySource, WriteTarget } from "./types.ts";
@@ -111,13 +111,6 @@ export class ProcessLock {
 	}
 }
 
-/** Result of an append operation. */
-export interface AppendResult {
-	entry: MemoryEntry;
-	filePath: string;
-	/** Cleaned (metadata-stripped) main-file length when the target was a main file — not used for category files. */
-}
-
 /**
  * Append one entry to a category file. Returns the stored entry.
  * Appends are atomic enough: single-process mutex + cross-process lockfile +
@@ -147,51 +140,6 @@ export async function appendEntry(
 		}),
 	);
 	return entry;
-}
-
-/**
- * Cleaned main-file content: metadata comment lines stripped, whitespace compacted.
- * Intended for diagnostics and tooling; the index is generated from entries.
- */
-export function cleanMainContent(raw: string): string {
-	return raw
-		.split("\n")
-		.filter((line) => !line.trim().startsWith("<!--") || !line.includes("-->"))
-		.join("\n")
-		.replace(/\n{3,}/g, "\n\n")
-		.trim();
-}
-
-/**
- * Read the cleaned length of a layer's main file (0 when missing).
- */
-export async function mainCleanLength(layer: Layer, globalDir: string, projectRoot: string): Promise<number> {
-	const raw = await readFileOrEmpty(mainFilePath(layer, globalDir, projectRoot));
-	return cleanMainContent(raw).length;
-}
-
-/** Debounce helper for scheduling background writes (index refresh). */
-export class Debouncer {
-	private timers = new Map<string, NodeJS.Timeout>();
-
-	/** (Re)schedule `fn` for `key` after `ms`. */
-	schedule(key: string, fn: () => void | Promise<void>, ms: number = WRITE_DEBOUNCE_MS): void {
-		const existing = this.timers.get(key);
-		if (existing) clearTimeout(existing);
-		const t = setTimeout(() => {
-			this.timers.delete(key);
-			void fn();
-		}, ms);
-		// Don't hold the process open for debounced background work.
-		t.unref?.();
-		this.timers.set(key, t);
-	}
-
-	/** Cancel all pending timers (shutdown). */
-	clearAll(): void {
-		for (const t of this.timers.values()) clearTimeout(t);
-		this.timers.clear();
-	}
 }
 
 /** Validate that a target is writable (a category file, never the main file). */
@@ -326,6 +274,52 @@ export async function applyConsolidation(
 			await fs.writeFile(`${filePath}.bak`, raw, "utf8");
 			await fs.writeFile(filePath, content, "utf8");
 			return { changed: true, removed, updated };
+		}),
+	);
+}
+
+/**
+ * Rewrite the keyword list of specific entries in one category file.
+ *
+ * Used by the `/memory rebuild` keyword re-extraction pass. Conservative like
+ * applyConsolidation: unknown ids are skipped, an update that would leave an
+ * entry without a keyword is ignored, and the previous file is kept as `.bak`.
+ */
+export async function applyTagUpdates(
+	target: WriteTarget,
+	deps: ApplyDeps,
+	updates: Map<string, string[]>,
+): Promise<{ changed: boolean; updated: number }> {
+	if (updates.size === 0) return { changed: false, updated: 0 };
+	const filePath = categoryFilePath(target, deps.globalDir, deps.projectRoot);
+	return deps.mutex.run(filePath, () =>
+		deps.plock.withLock(filePath, async () => {
+			const raw = await readFileOrEmpty(filePath);
+			if (!raw) return { changed: false, updated: 0 };
+			const { head, blocks } = splitBlocks(raw);
+			if (blocks.length === 0) return { changed: false, updated: 0 };
+
+			let updated = 0;
+			const kept: MemoryEntry[] = [];
+			for (const block of blocks) {
+				const next = updates.get(block.id);
+				if (!next || next.length === 0) {
+					kept.push(block.entry);
+					continue;
+				}
+				if (next.length === block.entry.tags.length && next.every((t, i) => t === block.entry.tags[i])) {
+					kept.push(block.entry);
+					continue;
+				}
+				updated++;
+				kept.push({ ...block.entry, tags: next });
+			}
+			if (updated === 0) return { changed: false, updated: 0 };
+
+			const content = `${head ? `${head}\n\n` : ""}${kept.map(serializeEntry).join("")}`;
+			await fs.writeFile(`${filePath}.bak`, raw, "utf8");
+			await fs.writeFile(filePath, content, "utf8");
+			return { changed: true, updated };
 		}),
 	);
 }

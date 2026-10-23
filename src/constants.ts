@@ -31,9 +31,6 @@ export const INDEX_BUDGET = 3000;
 /** Search results page size. */
 export const PAGE_SIZE = 10;
 
-/** Debounce window (ms) for background writes (index refresh scheduling). */
-export const WRITE_DEBOUNCE_MS = 5000;
-
 /** Self-timeout (ms) for background LLM calls (review / handoff). */
 export const LLM_TIMEOUT_MS = 120_000;
 /** Sessions with fewer valid messages than this are skipped by auto-extraction. */

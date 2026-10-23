@@ -51,9 +51,4 @@ export class SnapshotManager {
 		this.compactionDirty = false;
 		return this.snapshot;
 	}
-
-	/** True when a snapshot exists (i.e. at least one injection happened). */
-	get hasSnapshot(): boolean {
-		return this.snapshot !== null;
-	}
 }

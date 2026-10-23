@@ -6,34 +6,19 @@ Every memory is stored as **a body plus 1–3 keywords**. The keywords go into a
 
 ## Changelog
 
+### 0.7.0
+
+- **`/memory rebuild` now re-derives keywords with the model.** The index is the only memory content that enters the context window, so a stale or bloated keyword costs a memory its reachability. Rebuild sends every entry (batched, ids + current keywords + body) to the session model, validates the answer against the 1–3 / ≤8 rule, writes the surviving keywords back into the entry metadata (`.bak` kept), then regenerates `MEMORY.md`. Unusable answers keep the stored keywords; if the model fails entirely, the stored tags are repaired deterministically. Costs `ceil(entries / 12)` LLM calls, so it is a command, never background work.
+- **Keyword hygiene on the read path.** Legacy tag fields are split and validated before indexing (`#a #b #c` stored as one tag used to reach the index as the single unsearchable blob `#a-#b-#c`). Bodies with no usable keyword still get a derived one, so no memory drops out of the index. Search uses the same repaired keywords.
+- **The `handoff` marker no longer breaks the keyword contract** — it competes for the 1–3 budget instead of always being appended as a 4th keyword.
+- **Exit flush actually flushes.** `session_shutdown` now awaits the final review (hard-capped); previously it fired and returned, so pi's `process.exit` killed the in-flight extraction.
+- **Compaction handoff transcript is capped by characters.** It used to slice the message *array* by a character budget, which kept an arbitrary number of messages.
+- **Truncated entries can no longer be stored.** `stopReason: "length"` covers providers that report truncation, but a response can still arrive looking successful while one entry inside it is cut — the real global store carried a half sentence with a dangling code span for months. `src/integrity.ts` now rejects text with an unclosed code span, an excess of `(`/`[`/`{`, or a trailing opening delimiter. Delimiter counting runs on the prose outside code spans, so shell snippets and regexes do not trip it; auto-extraction silently drops such an entry (the next round retries), `memory_write` rejects it with an actionable message.
+- Dead code removed (`Debouncer`, `WRITE_DEBOUNCE_MS`, `cleanMainContent`, `mainCleanLength`, `SnapshotManager.hasSnapshot`, `AppendResult`).
+
 ### 0.6.0
 
 - New `/memory` command: `show` (keyword index + watermark), `compact` (merge duplicates now, regardless of the threshold), `rebuild` (regenerate `MEMORY.md`). Argument completion included.
-
-### 0.5.0
-
-- **Keyword contract enforced.** Every memory carries 1–3 keywords; each is at most 8 Chinese characters or 8 english words. `memory_write` rejects a write with an actionable error instead of storing an unusable keyword; the background extractor derives a keyword when the model omits one, so no memory is ever keyword-less.
-- **`MEMORY.md` is a unique keyword table.** One line per keyword (`#deploy (3)`), no bodies, no gists. Keywords are unique per layer by a separator-insensitive key, so `serializeConversation` / `serialize-conversation` / `Serialize Conversation` collapse into one line. Caps at 200 keywords per layer (`PI_MEMORY_AUTO_INDEX_BUDGET` bounds the injected bytes).
-- **Consolidation is triggered by accumulated memories, not by output size.** Each `MEMORY.md` carries `<!-- stats: entries=… keywords=… sinceLast=… -->`; when `sinceLast` reaches `PI_MEMORY_AUTO_CONSOLIDATE_EVERY` (default 20), a background round asks the model for merge groups and keyword renames, validates every proposal against the entries that exist, applies it deterministically, and keeps a `.bak` of each rewritten file. The old trigger (a MEMORY.md that had to reach 1000 chars — which only the consolidator could write) could never fire.
-- `memory_search mode:"tag"` is now an exact canonical-keyword lookup: a keyword copied from the index always resolves.
-- `npm run index:rebuild` prints per-layer stats (memories / keywords / sinceLast).
-
-### 0.4.0
-
-- Injection became a deterministic index instead of an LLM-consolidated digest: no `MEMORY.md` had ever been created, so every session started with an empty memory block.
-- Search became token-based instead of compiling the whole query into one regex (multi-word and natural-language queries used to return nothing).
-- New `id` search mode, id auto-detection in keyword mode, newest-entries fallback instead of an empty result.
-
-### 0.3.0
-
-- Review/handoff transcripts use pi's `serializeConversation` (tool calls + truncated tool results included)
-- Review prompt carries an "Existing memories" digest for dedup, plus an anti-hallucination guard
-- Transcript capped at 60k chars, keeping the most recent tail
-
-### 0.2.0
-
-- Truncated memories are rejected instead of stored (stopReason `length`)
-- Background LLM maxTokens raised to 10000, configurable
 
 ## Model
 
@@ -72,7 +57,7 @@ pi install npm:@shanelevs/pi-memory-auto
 |---|---|
 | `/memory` or `/memory show` | Print both layers' keyword tables, memory/keyword counts, the `sinceLast` watermark, the consolidation marker, and the file paths. The report is added to the transcript as a custom message (so the agent sees the current index too). |
 | `/memory compact` | Run a consolidation round immediately — merge duplicate memories and reconcile keywords — then reset the watermark. Needs a session model; failure leaves the store untouched. |
-| `/memory rebuild` | Regenerate `MEMORY.md` from the category files (recovers from hand edits or a format migration) and report how many memories/keywords each layer now has. |
+| `/memory rebuild` | **Re-derive every memory's keywords with the session model**, write them back into the entry metadata (`.bak` kept), then regenerate `MEMORY.md`. Repairs legacy `#a #b #c` tag blobs, vague or over-long keywords. Batched 12 entries per call; without a session model it only repairs malformed tags deterministically. |
 
 ## How it works
 
@@ -98,7 +83,7 @@ pi install npm:@shanelevs/pi-memory-auto
 #serialize-conversation (2)
 ```
 
-The `(n)` is how many memories share the keyword. `sinceLast` is the consolidation watermark: memories added since the last round.
+The `(n)` is **how many memories use that keyword** — not an entry number. It is the only ranking signal in the table (most-shared keywords sort first, then alphabetical), so a high count means "this is a frequent topic, searching it returns several memories". `sinceLast` is the consolidation watermark: memories added since the last round.
 
 ### Entry format
 
@@ -109,15 +94,18 @@ Deploy with `rsync --delete`; back up the previous release first.
 
 - `tags` are the keywords (1–3). They are the retrieval surface.
 - Metadata comments are stripped from the injected index and always kept in search results.
+- The body must be complete: text with an unclosed code span, unbalanced `(`/`[`/`{`, or a trailing opening delimiter is rejected as truncated (`src/integrity.ts`).
 
 ### Keyword rules
 
 | Rule | Where it is enforced |
 |---|---|
-| 1–3 per memory | `sanitizeKeywords` on `memory_write` (rejects), `parseReviewResponse` (derives one if missing) |
-| ≤ 8 Chinese characters or 8 english words | `keywordIssue`; the extractor prompt states it too |
+| 1–3 per memory | `sanitizeKeywords` on `memory_write` (rejects), `parseReviewResponse` / `runHandoff` (derive or trim), `coerceKeywords` on read + `/memory rebuild` |
+| ≤ 8 Chinese characters or 8 english words | `keywordIssue`; the extractor and rekey prompts state it too |
 | Unique per layer | canonical key = lowercase with separators removed (`src/keywords.ts`) |
 | ≤ 200 per layer | `collectKeywords` cap; the least-used keywords are dropped from the table (their memories stay searchable by text) |
+
+Stored tags are repaired on read (`coerceKeywords`): legacy space-separated `#a #b #c` blobs are split back into individual keywords, over-long or invalid ones are dropped, and an entry left with nothing gets a keyword derived from its body. The read path never writes — `/memory rebuild` is what persists the repair. |
 
 ### Injection
 

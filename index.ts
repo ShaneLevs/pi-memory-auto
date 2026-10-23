@@ -19,22 +19,23 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Type } from "typebox";
 import { loadConfig } from "./src/config.ts";
 import { CONSOLIDATION_TIMEOUT_MS, runConsolidation } from "./src/consolidate.ts";
-import { CLASSIFICATION_RUBRIC, EXISTING_MEMORIES_MAX_CHARS, HANDOFF_TRANSCRIPT_MAX_CHARS, INJECTION_PREAMBLE, LLM_TIMEOUT_MS, MAIN_FILE, WRITABLE_FILES } from "./src/constants.ts";
+import { CLASSIFICATION_RUBRIC, EXISTING_MEMORIES_MAX_CHARS, INJECTION_PREAMBLE, LLM_TIMEOUT_MS, MAIN_FILE, WRITABLE_FILES } from "./src/constants.ts";
 import { isTrivialSession, runReview, serializeTranscript } from "./src/extractor.ts";
 import { runHandoff } from "./src/handoff.ts";
 import { materializeAll, type LayerStats } from "./src/indexer.ts";
-import { MAX_KEYWORDS, MAX_KEYWORDS_PER_LAYER, sanitizeKeywords } from "./src/keywords.ts";
+import { findTruncationSignal } from "./src/integrity.ts";
+import { MAX_KEYWORDS, sanitizeKeywords } from "./src/keywords.ts";
 import { buildMemoryReport } from "./src/report.ts";
+import { runKeywordRekey } from "./src/rekey.ts";
 import { formatSearchResult, loadAllEntries, searchEntries } from "./src/search.ts";
 import { SnapshotManager } from "./src/snapshot.ts";
-import { Debouncer, FileMutex, ProcessLock, appendEntry, isWritableTarget } from "./src/store.ts";
+import { FileMutex, ProcessLock, appendEntry, isWritableTarget } from "./src/store.ts";
 import { countTurnsFromBranch } from "./src/turns.ts";
 import type { Layer, SearchMode } from "./src/types.ts";
 
 export default function piMemoryAuto(pi: ExtensionAPI) {
 	const config = loadConfig();
 	const mutex = new FileMutex();
-	const debouncer = new Debouncer();
 	const snapshots = new SnapshotManager();
 
 	let projectRoot = process.cwd();
@@ -112,22 +113,22 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 		return lines.join("\n");
 	}
 
-	/** Run one background extraction review. Fire-and-forget, never blocks. */
-	function scheduleReview(ctx: ExtensionContext, timeoutMs?: number): void {
-		if (reviewInFlight) return;
+	/** Run one background extraction review. Fire-and-forget unless awaited. */
+	function scheduleReview(ctx: ExtensionContext, timeoutMs?: number): Promise<void> {
+		if (reviewInFlight) return Promise.resolve();
 		const { model, registry } = modelInfo(ctx);
-		if (!model || !registry) return;
+		if (!model || !registry) return Promise.resolve();
 		const branch = ctx.sessionManager.getBranch().filter((e) => (e as { type?: string }).type === "message").map((e) => (e as { message?: unknown }).message);
-		if (isTrivialSession(branch.length)) return;
+		if (isTrivialSession(branch.length)) return Promise.resolve();
 		const transcript = serializeTranscript(branch);
-		if (transcript.trim().length === 0) return;
+		if (transcript.trim().length === 0) return Promise.resolve();
 
 		reviewInFlight = true;
-		void existingMemoriesDigest()
+		return existingMemoriesDigest()
 			.then((existingMemories) => runReview(writeDeps(), transcript, model, registry, timeoutMs, existingMemories))
-			.then((written) => {
+			.then(async (written) => {
 				if (written.length === 0) return;
-				void refreshIndexes(ctx);
+				await refreshIndexes(ctx);
 				if (ctx.hasUI) ctx.ui.notify(`memory-auto: saved ${written.length} memory entries`, "info");
 			})
 			.catch(() => undefined)
@@ -217,6 +218,19 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 					isError: true,
 				};
 			}
+			const truncation = findTruncationSignal(params.text);
+			if (truncation) {
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: `Write rejected: the memory text looks truncated (${truncation}). Send the complete, self-contained text — a stored half sentence cannot be understood by a future session.`,
+						},
+					],
+					details: { summary: "text rejected (truncated)" },
+					isError: true,
+				};
+			}
 			const entry = await appendEntry({ layer, file: params.file as never }, params.text, {
 				tags: keywords,
 				source: "user",
@@ -245,21 +259,45 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 	const MEMORY_SUBS = [
 		{ value: "show", label: "show", description: "Print the keyword index and consolidation watermark" },
 		{ value: "compact", label: "compact", description: "Merge duplicate memories now, regardless of the threshold" },
-		{ value: "rebuild", label: "rebuild", description: "Regenerate MEMORY.md from the category files" },
+		{ value: "rebuild", label: "rebuild", description: "Re-derive every memory's keywords with the model, then regenerate MEMORY.md" },
 	];
 
 	pi.registerCommand("memory", {
-		description: "Show the memory keyword index; 'compact' merges duplicates now; 'rebuild' regenerates MEMORY.md",
+		description: "Show the memory keyword index; 'compact' merges duplicates now; 'rebuild' re-derives keywords and regenerates MEMORY.md",
 		getArgumentCompletions: (prefix) => MEMORY_SUBS.filter((s) => s.value.startsWith(prefix.trim().toLowerCase())),
 		handler: async (args, ctx) => {
 			syncProject(ctx);
 			const sub = (args.trim().split(/\s+/)[0] ?? "").toLowerCase();
 
 			if (sub === "rebuild") {
+				// The index is the only memory content in context, so a rebuild
+				// re-derives every entry's keywords with the session model rather
+				// than just re-rendering the stored ones. Without a session model the
+				// same pass still repairs malformed tags deterministically and
+				// persists that repair, so the store heals either way.
+				const entries = await loadAllEntries(config.globalDir, projectRoot);
+				const { model, registry } = modelInfo(ctx);
+				const withModel = Boolean(model && registry);
+				let summary = "";
+				if (entries.length > 0) {
+					if (withModel) ctx.ui.notify(`memory: re-extracting keywords for ${entries.length} ${entries.length === 1 ? "memory" : "memories"}…`, "info");
+					try {
+						const rekeyed = await runKeywordRekey(writeDeps(), entries, model, registry, {
+							onProgress: (done, all) => {
+								if (ctx.hasUI && done < all) ctx.ui.notify(`memory: keywords ${done}/${all}…`, "info");
+							},
+						});
+						summary = withModel
+							? ` · keywords re-derived: ${rekeyed.updated} changed, ${rekeyed.agreed} already good, ${rekeyed.unchanged} kept`
+							: ` · no session model: repaired ${rekeyed.updated} malformed keyword list${rekeyed.updated === 1 ? "" : "s"} only`;
+					} catch (error) {
+						ctx.ui.notify(`memory: keyword re-extraction failed — ${error instanceof Error ? error.message : String(error)}`, "error");
+					}
+				}
 				const stats = await materializeAll(indexDeps());
 				const ok = [stats.global, stats.project].some((s) => s.written);
 				ctx.ui.notify(
-					`memory: index ${ok ? "rebuilt" : "already current"} — global ${stats.global.entries}/${stats.global.keywords}, project ${stats.project.entries}/${stats.project.keywords}`,
+					`memory: index ${ok ? "rebuilt" : "already current"} — global ${stats.global.entries}/${stats.global.keywords}, project ${stats.project.entries}/${stats.project.keywords}${summary}`,
 					"info",
 				);
 				return;
@@ -367,7 +405,11 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 		snapshots.markCompacted(); // re-inject after compaction (free cache boundary)
 		const { model, registry } = modelInfo(ctx);
 		if (model && registry) {
-			const transcript = serializeTranscript([...event.preparation.messagesToSummarize].slice(-HANDOFF_TRANSCRIPT_MAX_CHARS));
+			// Pass the messages as-is: serializeTranscript caps the serialized text by
+			// CHARACTERS (HANDOFF_TRANSCRIPT_MAX_CHARS, keeping the tail). Slicing the
+			// message array by that number instead would keep N messages, which has
+			// nothing to do with the budget.
+			const transcript = serializeTranscript([...event.preparation.messagesToSummarize]);
 			void runHandoff(writeDeps(), transcript, model, registry)
 				.then((written) => {
 					if (written.length > 0) void refreshIndexes(ctx);
@@ -379,20 +421,26 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 
 	// Exit flush: one final extraction so the tail of the conversation is not
 	// lost. reload/new/resume/fork do not flush (runtime teardown, not the end
-	// of a conversation). Short self-timeout so quitting never hangs.
+	// of a conversation).
+	//
+	// pi AWAITS this handler and then tears the runtime down with process.exit(),
+	// so the review must be awaited here — a fire-and-forget promise would be
+	// killed mid-request. The hard timeout keeps quitting snappy.
 	pi.on("session_shutdown", async (event, ctx) => {
-		if (event.reason !== "quit") {
-			debouncer.clearAll();
-			return;
-		}
+		if (event.reason !== "quit") return;
 		try {
-			scheduleReview(ctx, SHUTDOWN_FLUSH_TIMEOUT_MS);
+			await Promise.race([
+				scheduleReview(ctx, SHUTDOWN_FLUSH_TIMEOUT_MS),
+				new Promise<void>((resolve) => {
+					// Deliberately NOT unref'd: this timer is the guarantee that the
+					// await above terminates even if the provider never answers.
+					setTimeout(resolve, SHUTDOWN_FLUSH_TIMEOUT_MS + 2_000);
+				}),
+			]);
 		} catch {
 			// Never block shutdown.
 		}
 	});
-
-	void MAX_KEYWORDS_PER_LAYER; // documented cap, enforced in index-map.ts
 }
 
 // Local import kept at bottom to avoid a top-level name clash in the factory.

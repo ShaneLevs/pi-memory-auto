@@ -16,7 +16,7 @@
 
 import { MAIN_FILE, PROJECT_CATEGORY_FILES, GLOBAL_CATEGORY_FILES } from "./constants.ts";
 import { parseEntries, parseTime } from "./entry.ts";
-import { keywordKey } from "./keywords.ts";
+import { MAX_KEYWORDS, coerceKeywords, keywordKey } from "./keywords.ts";
 import { categoryFilePath, memoryDir, readFileOrEmpty } from "./store.ts";
 import type { MemoryEntry, SearchHit, SearchMode, SearchResult } from "./types.ts";
 
@@ -103,7 +103,8 @@ interface Scored {
 /** Score one entry against the query tokens. */
 function scoreEntry(loaded: LoadedEntry, tokens: string[]): Scored | null {
 	const { entry, file } = loaded;
-	const tags = entry.tags.map((t) => t.trim().replace(/^#+/, "").toLowerCase()).filter(Boolean);
+	// Repaired tags, so a legacy space-separated tag field is still matchable.
+	const tags = coerceKeywords(entry.tags, entry.text).keywords.map((t) => t.trim().replace(/^#+/, "").toLowerCase()).filter(Boolean);
 	const text = entry.text.toLowerCase();
 	let matched = 0;
 	let tagExact = 0;
@@ -157,7 +158,10 @@ export function searchEntries(all: LoadedEntry[], mode: SearchMode, query: strin
 			const rawQuery = q.split(/[,\s]+/).filter(Boolean);
 			const wanted = [...new Set(rawQuery.map((t) => keywordKey(t)).filter(Boolean))];
 			for (const loaded of all) {
-				const keys = loaded.entry.tags.map((t) => keywordKey(t)).filter(Boolean);
+				const keys = coerceKeywords(loaded.entry.tags, loaded.entry.text).keywords
+					.slice(0, MAX_KEYWORDS)
+					.map((t) => keywordKey(t))
+					.filter(Boolean);
 				let score = 0;
 				for (const w of wanted) {
 					if (keys.includes(w)) score += 10;

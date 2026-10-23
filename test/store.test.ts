@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
-import { appendEntry, cleanMainContent, FileMutex, isWritableTarget, mainCleanLength, ProcessLock } from "../src/store.ts";
+import { appendEntry, applyTagUpdates, FileMutex, isWritableTarget, ProcessLock } from "../src/store.ts";
 import { parseEntries } from "../src/entry.ts";
 
 const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "pma-store-"));
@@ -49,21 +49,46 @@ test("concurrent appends all land (mutex serializes)", async () => {
 	assert.equal(parseEntries(raw).length, 20);
 });
 
-test("cleanMainContent strips metadata and compacts blank lines", () => {
-	const raw = "<!-- mid: a -->\nfoo\n\n\n\n<!-- mid: b -->\nbar\n";
-	assert.equal(cleanMainContent(raw), "foo\n\nbar");
-});
-
-test("mainCleanLength counts cleaned chars", async () => {
-	const main = path.join(projectRoot, ".pi/agent/memory-auto/MEMORY.md");
-	await fs.mkdir(path.dirname(main), { recursive: true });
-	await fs.writeFile(main, "<!-- mid: x -->\n" + "y".repeat(1200), "utf8");
-	assert.ok((await mainCleanLength("project", globalDir, projectRoot)) >= 1200);
-});
-
 test("isWritableTarget rejects main file", () => {
 	assert.equal(isWritableTarget("project", "FAILURES"), true);
 	assert.equal(isWritableTarget("global", "USER"), true);
 	assert.equal(isWritableTarget("project", "MEMORY"), false);
 	assert.equal(isWritableTarget("global", "CONVENTIONS"), false);
+});
+
+test("applyTagUpdates rewrites only the given entries and keeps a .bak", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "pma-tags-"));
+	tmpDirs.push(root);
+	const g = path.join(root, "global");
+	const p = path.join(root, "proj");
+	const dir = path.join(p, ".pi/agent/memory-auto");
+	await fs.mkdir(dir, { recursive: true });
+	const file = path.join(dir, "DECISIONS.md");
+	await fs.writeFile(
+		file,
+		`<!-- mid: 20261001-aaaa | t: 2026-10-01 10:00:00 | p: proj | src: auto | tags: #a #b #c #d -->\nfirst\n\n<!-- mid: 20261002-bbbb | t: 2026-10-02 10:00:00 | p: proj | src: auto | tags: keep -->\nsecond\n\n`,
+		"utf8",
+	);
+	const res = await applyTagUpdates({ layer: "project", file: "DECISIONS" }, { globalDir: g, projectRoot: p, mutex, plock }, new Map([["20261001-aaaa", ["alpha", "beta"]]]));
+	assert.deepEqual(res, { changed: true, updated: 1 });
+	const parsed = parseEntries(await fs.readFile(file, "utf8"));
+	assert.deepEqual(parsed[0]!.tags, ["alpha", "beta"]);
+	assert.deepEqual(parsed[1]!.tags, ["keep"]);
+	assert.ok(await fs.stat(`${file}.bak`).then(() => true));
+});
+
+test("applyTagUpdates is a no-op for identical or empty updates", async () => {
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "pma-tags2-"));
+	tmpDirs.push(root);
+	const p = path.join(root, "proj");
+	const dir = path.join(p, ".pi/agent/memory-auto");
+	await fs.mkdir(dir, { recursive: true });
+	const file = path.join(dir, "DECISIONS.md");
+	const body = `<!-- mid: 20261001-aaaa | t: 2026-10-01 10:00:00 | p: proj | src: auto | tags: same -->\nx\n\n`;
+	await fs.writeFile(file, body, "utf8");
+	const before = await fs.readFile(file, "utf8");
+	const deps = { globalDir: path.join(root, "g"), projectRoot: p, mutex, plock };
+	assert.equal((await applyTagUpdates({ layer: "project", file: "DECISIONS" }, deps, new Map([["20261001-aaaa", ["same"]]]))).changed, false);
+	assert.equal((await applyTagUpdates({ layer: "project", file: "DECISIONS" }, deps, new Map())).changed, false);
+	assert.equal(await fs.readFile(file, "utf8"), before);
 });

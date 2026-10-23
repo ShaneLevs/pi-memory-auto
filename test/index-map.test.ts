@@ -99,3 +99,26 @@ test("deterministic for identical input", () => {
 	const entries = [mk("20261001-aaaa", ["b", "a"], "one"), mk("20261002-bbbb", ["a"], "two")];
 	assert.equal(buildMemoryIndex(entries, { budget: 900 }), buildMemoryIndex(entries, { budget: 900 }));
 });
+
+test("legacy space-separated tags become individual keywords, not one blob", () => {
+	// Pre-0.5 data: the whole "#a #b #c" string was stored as a single tag.
+	const entries = [
+		mk("20261001-aaaa", ["#svg #antd-icons #qlmanage"], "icons"),
+		mk("20261002-bbbb", ["svg"], "more icons"),
+	];
+	const table = collectKeywords(entries, "project");
+	const displays = table.rows.map((r) => r.display);
+	assert.ok(displays.includes("svg"), "#svg is its own keyword");
+	assert.ok(displays.includes("antd-icons"));
+	assert.ok(displays.includes("qlmanage"));
+	assert.ok(!table.rows.some((r) => r.key.length > 24), "no unsearchable blob keyword");
+	assert.equal(table.rows.find((r) => r.key === "svg")?.count, 2);
+});
+
+test("an entry with only invalid tags still contributes a derived keyword", () => {
+	const entries = [mk("20261001-aaaa", ["一二三四五六七八九"], "call `pnpm install`")];
+	const table = collectKeywords(entries, "project");
+	assert.equal(table.entryCount, 1);
+	assert.equal(table.derived, 1);
+	assert.equal(table.rows[0]!.key, "pnpm");
+});

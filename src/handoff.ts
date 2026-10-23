@@ -5,6 +5,7 @@
  */
 
 import { CLASSIFICATION_RUBRIC, HANDOFF_TRANSCRIPT_MAX_CHARS } from "./constants.ts";
+import { sanitizeKeywords } from "./keywords.ts";
 import { completeWithSessionModel } from "./llm.ts";
 import { appendEntry, type FileMutex, type ProcessLock } from "./store.ts";
 import type { MemoryEntry } from "./types.ts";
@@ -55,8 +56,12 @@ export async function runHandoff(
 	if (!result.ok) return written;
 
 	for (const c of parseReviewResponse(result.text, deps.projectRoot)) {
+		// Merge the handoff marker into the keyword budget instead of appending a
+		// 4th keyword: the 1-3 contract is what the index depends on, and a
+		// shared "handoff" keyword on every extracted entry is pure index noise.
+		const { keywords } = sanitizeKeywords([...c.tags, "handoff"]);
 		const entry = await appendEntry(c.target, c.text, {
-			tags: [...c.tags, "handoff"],
+			tags: keywords.length > 0 ? keywords : c.tags,
 			source: "auto",
 			globalDir: deps.globalDir,
 			projectRoot: deps.projectRoot,

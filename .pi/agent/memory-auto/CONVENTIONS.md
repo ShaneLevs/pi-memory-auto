@@ -1,0 +1,3 @@
+<!-- mid: 20261023-25a2 | t: 2026-10-23 23:55:48 | p: pi-memory-auto | src: user | tags: pi-cli,local-path-install,插件安装 -->
+pi-memory-auto is installed into the local pi as a LOCAL PATH package (`pi install /Users/shane/Documents/GitHub/pi-memory-auto`, stored as `../../Documents/GitHub/pi-memory-auto` in ~/.pi/agent/settings.json), not `npm:@shanelevs/pi-memory-auto`. pi loads local sources from the resolved path without copying, so edits in this repo are live on the next pi start; the npm copy under ~/.pi/agent/npm/node_modules must stay absent or the extension registers twice. Never re-install the npm entry for day-to-day dev — publish to npm only for other users.
+

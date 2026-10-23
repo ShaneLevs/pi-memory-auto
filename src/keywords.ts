@@ -107,6 +107,56 @@ export function sanitizeKeywords(raw: readonly string[]): SanitizeResult {
 }
 
 /**
+ * Split a raw tag field into candidate keywords.
+ *
+ * Commas are always separators. Whitespace only is a separator when the field
+ * is legacy `#`-prefixed data — the pre-0.5 extractor stored
+ * `#ui-taste #design-feedback #screenshots` as ONE tag, which used to reach the
+ * index as the single unsearchable blob `#ui-taste-#design-feedback-#screenshots`.
+ * A genuine multi-word keyword (`Serialize Conversation`, allowed up to 8 words)
+ * has no `#` and is kept whole.
+ */
+export function splitTagCandidates(raw: string): string[] {
+	return raw
+		.split(",")
+		.flatMap((part) => {
+			const trimmed = part.trim();
+			if (!trimmed) return [];
+			const words = trimmed.split(/\s+/);
+			const hashed = words.some((w) => w.startsWith("#"));
+			return hashed && words.length > 1 ? words : [trimmed];
+		})
+		.map((t) => t.trim().replace(/^#+/, ""))
+		.filter(Boolean);
+}
+
+export interface CoerceResult {
+	/** Keywords that satisfy the contract (1-3, each valid), in input order. */
+	keywords: string[];
+	/** The stored tag field violated the contract and should be rewritten. */
+	changed: boolean;
+	/** No usable keyword was stored, so one was derived from the text. */
+	derived: boolean;
+}
+
+/**
+ * Repair a stored tag list: split dirty separators, validate each keyword, cap
+ * at MAX_KEYWORDS, and derive one from the body when nothing survives.
+ *
+ * Read-path only — it never writes. `changed` tells a migration pass whether the
+ * entry still needs rewriting on disk.
+ */
+export function coerceKeywords(tags: readonly string[], text = ""): CoerceResult {
+	const candidates = tags.flatMap((t) => splitTagCandidates(t));
+	const { keywords } = sanitizeKeywords(candidates);
+	if (keywords.length > 0) {
+		const changed = keywords.length !== tags.length || keywords.some((k, i) => k !== tags[i]);
+		return { keywords, changed, derived: false };
+	}
+	return { keywords: [deriveKeyword(text)], changed: true, derived: true };
+}
+
+/**
  * Derive a keyword from an entry's text when none was supplied.
  * Prefers backticked identifiers, then latin identifiers, then CJK runs.
  */

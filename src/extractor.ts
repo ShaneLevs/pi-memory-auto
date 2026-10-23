@@ -13,6 +13,7 @@ import { CLASSIFICATION_RUBRIC, MIN_MESSAGES_FOR_REVIEW, TRANSCRIPT_MAX_CHARS } 
 import { deriveKeyword, sanitizeKeywords } from "./keywords.ts";
 import { convertToLlm, serializeConversation } from "@earendil-works/pi-coding-agent";
 import { completeWithSessionModel } from "./llm.ts";
+import { findTruncationSignal } from "./integrity.ts";
 import { appendEntry, isWritableTarget, type FileMutex, type ProcessLock } from "./store.ts";
 import type { Layer, MemoryEntry, WriteTarget } from "./types.ts";
 
@@ -80,6 +81,10 @@ export function parseReviewResponse(
 		if (!isWritableTarget(layer, file)) continue;
 		const text = textMatch[1].trim();
 		if (!text) continue;
+		// A truncated response can still parse into a syntactically valid block.
+		// Storing half a sentence would persist a memory that cannot be understood
+		// later, so drop it instead — the next review round retries.
+		if (findTruncationSignal(text)) continue;
 		const candidates = (tagsMatch?.[1] ?? "")
 			.split(",")
 			.map((t) => t.trim())

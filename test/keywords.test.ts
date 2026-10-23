@@ -3,11 +3,13 @@ import { test } from "node:test";
 import {
 	MAX_KEYWORDS,
 	MAX_KEYWORDS_PER_LAYER,
+	coerceKeywords,
 	deriveKeyword,
 	keywordDisplay,
 	keywordIssue,
 	keywordKey,
 	sanitizeKeywords,
+	splitTagCandidates,
 } from "../src/keywords.ts";
 
 test("keywordKey collapses case and separators (uniqueness key)", () => {
@@ -61,4 +63,35 @@ test("deriveKeyword prefers backticked identifiers, then latin, then CJK", () =>
 
 test("per-layer cap is 200 keywords", () => {
 	assert.equal(MAX_KEYWORDS_PER_LAYER, 200);
+});
+
+test("splitTagCandidates splits legacy '#'-prefixed blobs but keeps multi-word keywords", () => {
+	assert.deepEqual(splitTagCandidates("#ui-taste #design-feedback #screenshots"), ["ui-taste", "design-feedback", "screenshots"]);
+	// A genuine multi-word keyword (allowed by the 8-word rule) survives whole.
+	assert.deepEqual(splitTagCandidates("Serialize Conversation"), ["Serialize Conversation"]);
+	// Commas are always separators.
+	assert.deepEqual(splitTagCandidates("deploy, rsync"), ["deploy", "rsync"]);
+	assert.deepEqual(splitTagCandidates("  "), []);
+});
+
+test("coerceKeywords repairs dirty tags in the read path", () => {
+	const dirty = coerceKeywords(["#a #b #c #d #e"], "body");
+	assert.deepEqual(dirty.keywords, ["a", "b", "c"]);
+	assert.equal(dirty.changed, true);
+	assert.equal(dirty.derived, false);
+
+	const clean = coerceKeywords(["deploy", "rsync"], "body");
+	assert.deepEqual(clean.keywords, ["deploy", "rsync"]);
+	assert.equal(clean.changed, false);
+});
+
+test("coerceKeywords derives a keyword when the stored tags are unusable", () => {
+	const r = coerceKeywords(["一二三四五六七八九"], "call `pnpm install` first");
+	assert.equal(r.derived, true);
+	assert.equal(r.changed, true);
+	assert.deepEqual(r.keywords, ["pnpm"]);
+});
+
+test("coerceKeywords never returns more than MAX_KEYWORDS", () => {
+	assert.equal(coerceKeywords(["a", "b", "c", "d", "e"], "x").keywords.length, MAX_KEYWORDS);
 });
