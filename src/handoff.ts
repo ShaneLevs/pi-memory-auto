@@ -20,8 +20,10 @@ Output format — at most 2 entries:
 ===ENTRY===
 FILE: <USER.md | TOOLING.md | LESSONS.md | CONVENTIONS.md | DECISIONS.md | FAILURES.md>
 LAYER: <global | project>
-TAGS: <comma,separated,tags or ->
+TAGS: <1-3 comma separated keywords>
 TEXT: <the memory text, concise, self-contained>
+
+Every entry needs 1-3 keywords: the terms a future session would search for (at most 8 Chinese characters or 8 english words each).
 
 If nothing is worth saving, respond with exactly: NOTHING_TO_SAVE`;
 

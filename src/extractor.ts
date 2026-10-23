@@ -10,6 +10,7 @@
  */
 
 import { CLASSIFICATION_RUBRIC, MIN_MESSAGES_FOR_REVIEW, TRANSCRIPT_MAX_CHARS } from "./constants.ts";
+import { deriveKeyword, sanitizeKeywords } from "./keywords.ts";
 import { convertToLlm, serializeConversation } from "@earendil-works/pi-coding-agent";
 import { completeWithSessionModel } from "./llm.ts";
 import { appendEntry, isWritableTarget, type FileMutex, type ProcessLock } from "./store.ts";
@@ -34,12 +35,13 @@ Output format — respond with entries, one block per memory, nothing else:
 ===ENTRY===
 FILE: <USER.md | TOOLING.md | LESSONS.md | CONVENTIONS.md | DECISIONS.md | FAILURES.md>
 LAYER: <global | project>
-TAGS: <comma,separated,tags or ->
+TAGS: <1-3 comma separated keywords>
 TEXT: <the memory text, concise, self-contained, one sentence to one short paragraph>
 
 Rules:
 - Follow the classification guide above strictly.
 - At most 3 entries per review; quality over quantity.
+- Every entry needs 1-3 keywords: the terms a future session would search for. Reuse an existing keyword when it fits instead of inventing a synonym. Each keyword is at most 8 Chinese characters or 8 english words.
 - If nothing is worth saving, respond with exactly: NOTHING_TO_SAVE
 - Do not store secrets, API keys, or tokens.`;
 
@@ -78,10 +80,13 @@ export function parseReviewResponse(
 		if (!isWritableTarget(layer, file)) continue;
 		const text = textMatch[1].trim();
 		if (!text) continue;
-		const tags = (tagsMatch?.[1] ?? "")
+		const candidates = (tagsMatch?.[1] ?? "")
 			.split(",")
 			.map((t) => t.trim())
 			.filter((t) => t && t !== "-");
+		const { keywords } = sanitizeKeywords(candidates);
+		// At least one keyword per memory: derive one when the model gave none.
+		const tags = keywords.length > 0 ? keywords : [deriveKeyword(text)];
 		out.push({ target: { layer, file: file as WriteTarget["file"] }, tags, text });
 	}
 	return out;

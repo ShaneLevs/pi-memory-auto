@@ -4,7 +4,8 @@
 
 import os from "node:os";
 import path from "node:path";
-import { DEFAULT_GLOBAL_DIR } from "./constants.ts";
+import { DEFAULT_GLOBAL_DIR, INDEX_BUDGET } from "./constants.ts";
+import { CONSOLIDATE_EVERY_DEFAULT } from "./consolidate.ts";
 import type { MemoryConfig } from "./types.ts";
 
 function envInt(env: NodeJS.ProcessEnv, name: string, fallback: number, min: number, max: number): number {
@@ -27,8 +28,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): MemoryConfig {
 	return {
 		reviewTurns: envInt(env, "PI_MEMORY_AUTO_REVIEW_TURNS", 10, 1, 1000),
 		globalDir,
-		renderBudget: 1000,
-		consolidateThreshold: 1000,
+		indexBudget: envInt(env, "PI_MEMORY_AUTO_INDEX_BUDGET", INDEX_BUDGET, 200, 6000),
+		consolidateEvery: envInt(env, "PI_MEMORY_AUTO_CONSOLIDATE_EVERY", CONSOLIDATE_EVERY_DEFAULT, 2, 500),
 		pageSize: 10,
 		/** maxTokens for background LLM calls; large enough that extraction
 		 *  responses are never truncated (stopReason "length" is rejected). */

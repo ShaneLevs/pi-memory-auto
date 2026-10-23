@@ -1,12 +1,13 @@
 /**
  * Storage layer: directories, append writes, per-file async mutex,
- * cross-process lockfile guard, and main-file consolidation trigger check.
+ * cross-process lockfile guard, and the main-file length helpers.
  */
 
 import fs from "node:fs/promises";
 import path from "node:path";
-import { MAIN_FILE, PROJECT_DIR, WRITABLE_FILES, WRITE_DEBOUNCE_MS } from "./constants.ts";
-import { generateEntryId, formatTime, serializeEntry } from "./entry.ts";
+import { ENTRY_META_PREFIX, MAIN_FILE, PROJECT_DIR, WRITABLE_FILES, WRITE_DEBOUNCE_MS } from "./constants.ts";
+import { generateEntryId, formatTime, parseEntries, serializeEntry } from "./entry.ts";
+import { keywordKey } from "./keywords.ts";
 import type { CategoryFile, Layer, MemoryEntry, MemorySource, WriteTarget } from "./types.ts";
 
 /** Compute the memory directory for a layer. */
@@ -150,7 +151,7 @@ export async function appendEntry(
 
 /**
  * Cleaned main-file content: metadata comment lines stripped, whitespace compacted.
- * Used for the consolidation trigger check and as the base of render trimming.
+ * Intended for diagnostics and tooling; the index is generated from entries.
  */
 export function cleanMainContent(raw: string): string {
 	return raw
@@ -169,7 +170,7 @@ export async function mainCleanLength(layer: Layer, globalDir: string, projectRo
 	return cleanMainContent(raw).length;
 }
 
-/** Debounce helper for scheduling background consolidation. */
+/** Debounce helper for scheduling background writes (index refresh). */
 export class Debouncer {
 	private timers = new Map<string, NodeJS.Timeout>();
 
@@ -196,4 +197,135 @@ export class Debouncer {
 /** Validate that a target is writable (a category file, never the main file). */
 export function isWritableTarget(layer: Layer, file: string): file is CategoryFile {
 	return (WRITABLE_FILES[layer] as readonly string[]).includes(file);
+}
+
+// ── Consolidation edits ────────────────────────────────────────────────────
+
+/** One merge: keep one entry, fold others into it, optionally rewrite it. */
+export interface MergeOp {
+	keepId: string;
+	dropIds: string[];
+	/** Replacement keyword list (already sanitized by the caller). */
+	tags?: string[];
+	/** Replacement body; omitted keeps the existing text. */
+	text?: string;
+}
+
+/** Keyword-level rename applied to every entry in the layer. */
+export interface KeywordRename {
+	from: string;
+	to: string;
+}
+
+export interface ConsolidationPlan {
+	merges: MergeOp[];
+	keywordRenames: KeywordRename[];
+}
+
+export interface ApplyDeps {
+	globalDir: string;
+	projectRoot: string;
+	mutex: FileMutex;
+	plock: ProcessLock;
+}
+
+interface EntryBlock {
+	id: string;
+	entry: MemoryEntry;
+}
+
+/** Split a category file into head text + parsed entry blocks. */
+function splitBlocks(raw: string): { head: string; blocks: EntryBlock[] } {
+	const head: string[] = [];
+	const blocks: EntryBlock[] = [];
+	let current: string[] | null = null;
+	const flush = () => {
+		if (!current) return;
+		const [entry] = parseEntries(current.join("\n"));
+		if (entry) blocks.push({ id: entry.id, entry });
+		current = null;
+	};
+	for (const line of raw.split("\n")) {
+		if (line.trim().startsWith(ENTRY_META_PREFIX)) {
+			flush();
+			current = [line];
+			continue;
+		}
+		if (current) current.push(line);
+		else head.push(line);
+	}
+	flush();
+	return { head: head.join("\n").replace(/\s+$/, ""), blocks };
+}
+
+/**
+ * Apply a consolidation plan to one category file.
+ *
+ * Deterministic and conservative: unknown ids are ignored, a merge whose keep
+ * target is missing is skipped, every memory keeps at least one keyword, and
+ * the previous file is kept as `<file>.bak`. Never deletes the file itself.
+ */
+export async function applyConsolidation(
+	target: WriteTarget,
+	deps: ApplyDeps,
+	plan: ConsolidationPlan,
+): Promise<{ changed: boolean; removed: number; updated: number }> {
+	const filePath = categoryFilePath(target, deps.globalDir, deps.projectRoot);
+	return deps.mutex.run(filePath, () =>
+		deps.plock.withLock(filePath, async () => {
+			const raw = await readFileOrEmpty(filePath);
+			if (!raw) return { changed: false, removed: 0, updated: 0 };
+			const { head, blocks } = splitBlocks(raw);
+			if (blocks.length === 0) return { changed: false, removed: 0, updated: 0 };
+
+			const byId = new Map(blocks.map((b) => [b.id, b.entry]));
+			const drops = new Set<string>();
+			const rewrites = new Map<string, MemoryEntry>();
+			for (const merge of plan.merges) {
+				const keep = byId.get(merge.keepId);
+				if (!keep) continue;
+				for (const id of merge.dropIds) if (id !== merge.keepId && byId.has(id)) drops.add(id);
+				const tags = merge.tags && merge.tags.length > 0 ? merge.tags : keep.tags;
+				const text = merge.text?.trim() || keep.text;
+				if (tags !== keep.tags || text !== keep.text) rewrites.set(keep.id, { ...keep, tags, text });
+			}
+
+			const renamed = (entry: MemoryEntry): MemoryEntry => {
+				if (plan.keywordRenames.length === 0 || entry.tags.length === 0) return entry;
+				const tags: string[] = [];
+				const seen = new Set<string>();
+				for (const tag of entry.tags) {
+					const from = keywordKey(tag);
+					const rename = plan.keywordRenames.find((r) => keywordKey(r.from) === from);
+					const next = rename ? rename.to : tag;
+					const key = keywordKey(next);
+					if (!key || seen.has(key)) continue;
+					seen.add(key);
+					tags.push(next);
+				}
+				if (tags.length === 0) return entry; // never leave an entry without a keyword
+				return { ...entry, tags };
+			};
+
+			const kept: MemoryEntry[] = [];
+			let removed = 0;
+			let updated = 0;
+			for (const block of blocks) {
+				if (drops.has(block.id)) {
+					removed++;
+					continue;
+				}
+				const rewritten = rewrites.get(block.id);
+				const next = renamed(rewritten ?? block.entry);
+				if (next !== block.entry) updated++;
+				kept.push(next);
+			}
+			if (removed === 0 && updated === 0) return { changed: false, removed: 0, updated: 0 };
+
+			const content = `${head ? `${head}\n\n` : ""}${kept.map(serializeEntry).join("")}`;
+			await fs.writeFile(`${filePath}.bak`, raw, "utf8");
+			await fs.writeFile(filePath, content, "utf8");
+			return { changed: true, removed, updated };
+		}),
+	);
 }

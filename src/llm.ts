@@ -1,6 +1,5 @@
 /**
- * LLM calls for background work (auto-extraction review, consolidation,
- * compaction handoff).
+ * LLM calls for background work (auto-extraction review, compaction handoff).
  *
  * Uses the official extension seam: ctx.modelRegistry.complete(model, context,
  * options) — request-time authentication (API key / OAuth) is resolved

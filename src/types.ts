@@ -35,7 +35,7 @@ export interface MemoryEntry {
 }
 
 /** Search modes for memory_search. */
-export type SearchMode = "keyword" | "tag" | "recent" | "all";
+export type SearchMode = "keyword" | "tag" | "recent" | "all" | "id";
 
 /** A search hit: the entry plus its origin file for context. */
 export interface SearchHit {
@@ -53,6 +53,10 @@ export interface SearchResult {
 	page: number;
 	pageSize: number;
 	hasMore: boolean;
+	/** True when keyword/all found no match and fell back to newest entries. */
+	fallback: boolean;
+	/** Query tokens used for matching (for diagnostics in the result text). */
+	tokens: string[];
 }
 
 /** Layer × file write target for memory_write. */
@@ -67,13 +71,13 @@ export interface MemoryConfig {
 	reviewTurns: number;
 	/** Global memory directory. */
 	globalDir: string;
-	/** Rendered per-main-file character budget. */
-	renderBudget: number;
-	/** Cleaned main-file length that triggers consolidation. */
-	consolidateThreshold: number;
+	/** Character budget for the injected memory index (per layer). */
+	indexBudget: number;
+	/** Memories added between automatic consolidation rounds. */
+	consolidateEvery: number;
 	/** Search page size. */
 	pageSize: number;
-	/** maxTokens for background LLM calls (extraction / handoff / consolidation). */
+	/** maxTokens for background LLM calls (extraction / handoff). */
 	llmMaxTokens: number;
 }
 

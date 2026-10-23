@@ -1,0 +1,64 @@
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import {
+	MAX_KEYWORDS,
+	MAX_KEYWORDS_PER_LAYER,
+	deriveKeyword,
+	keywordDisplay,
+	keywordIssue,
+	keywordKey,
+	sanitizeKeywords,
+} from "../src/keywords.ts";
+
+test("keywordKey collapses case and separators (uniqueness key)", () => {
+	assert.equal(keywordKey("serializeConversation"), "serializeconversation");
+	assert.equal(keywordKey("serialize-conversation"), "serializeconversation");
+	assert.equal(keywordKey("Serialize Conversation"), "serializeconversation");
+	assert.equal(keywordKey("#pnpm"), "pnpm");
+	assert.equal(keywordKey("   "), "");
+});
+
+test("keywordDisplay is lowercase and dash-joins words", () => {
+	assert.equal(keywordDisplay("#PnPM"), "pnpm");
+	assert.equal(keywordDisplay("check list"), "check-list");
+	assert.equal(keywordDisplay("serializeConversation"), "serializeconversation");
+});
+
+test("keywordIssue enforces 8 CJK chars / 8 words", () => {
+	assert.equal(keywordIssue("部署"), null);
+	assert.equal(keywordIssue("一二三四五六七八"), null);
+	assert.equal(keywordIssue("一二三四五六七八九"), "9 characters (max 8)");
+	assert.equal(keywordIssue("a b c d e f g h"), null);
+	assert.equal(keywordIssue("a b c d e f g h i"), "9 words (max 8)");
+	assert.equal(keywordIssue("serializeConversation"), null);
+	assert.equal(keywordIssue("   "), "keyword is empty");
+});
+
+test("sanitizeKeywords validates, dedupes by key and caps at 3", () => {
+	const r = sanitizeKeywords(["部署", "serializeConversation", "serialize-conversation", "deploy", "extra"]);
+	assert.deepEqual(r.keywords, ["部署", "serializeconversation", "deploy"]);
+	assert.equal(r.issues.length, 1); // "extra" exceeded the cap
+	assert.match(r.issues[0]!, /more than 3 keywords/);
+
+	const bad = sanitizeKeywords(["一二三四五六七八九"]);
+	assert.deepEqual(bad.keywords, []);
+	assert.match(bad.issues[0]!, /9 characters \(max 8\)/);
+});
+
+test("sanitizeKeywords keeps at most MAX_KEYWORDS", () => {
+	const r = sanitizeKeywords(["a1", "a2", "a3", "a4"]);
+	assert.equal(r.keywords.length, MAX_KEYWORDS);
+});
+
+test("deriveKeyword prefers backticked identifiers, then latin, then CJK", () => {
+	assert.equal(deriveKeyword("call `utools.copyImage(x)` here"), "utools.copyimage");
+	assert.equal(deriveKeyword("Use pnpm in this repo"), "use");
+	// Latin tokens win over CJK runs; a pure-CJK body yields a CJK keyword.
+	assert.equal(deriveKeyword("这个仓库必须使用 pnpm"), "pnpm");
+	assert.equal(deriveKeyword("这个仓库很重要"), "这个仓库很重要");
+	assert.equal(deriveKeyword("!!!"), "misc");
+});
+
+test("per-layer cap is 200 keywords", () => {
+	assert.equal(MAX_KEYWORDS_PER_LAYER, 200);
+});

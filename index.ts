@@ -3,25 +3,31 @@
  *
  * Wires:
  * - memory_search / memory_write tools (search-only access; no memory_read)
- * - snapshot injection on session_start + after compaction (before_agent_start)
+ * - keyword-table injection on session start + after compaction
  * - turn-based auto-extraction (default every 10 turns)
- * - main-file consolidation trigger (cleaned >= 1000 chars, debounced)
- * - compaction handoff
- * - shutdown flush
+ * - consolidation every N new memories (merge duplicates, reconcile keywords)
+ * - compaction handoff, shutdown flush
+ *
+ * Injection model: the system prompt receives the layer's MEMORY.md keyword
+ * table — unique keywords only, no bodies. The agent matches a keyword against
+ * the current task (including synonyms/translations), calls memory_search with
+ * it, and gets the entry text from the category files.
  */
 
 import { StringEnum } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { loadConfig } from "./src/config.ts";
-import { CLASSIFICATION_RUBRIC, EXISTING_MEMORIES_MAX_CHARS, INJECTION_PREAMBLE, MAIN_FILE, PROJECT_CATEGORY_FILES, GLOBAL_CATEGORY_FILES, WRITABLE_FILES, HANDOFF_TRANSCRIPT_MAX_CHARS, LLM_TIMEOUT_MS } from "./src/constants.ts";
-import { Consolidator } from "./src/consolidator.ts";
+import { CONSOLIDATION_TIMEOUT_MS, runConsolidation } from "./src/consolidate.ts";
+import { CLASSIFICATION_RUBRIC, EXISTING_MEMORIES_MAX_CHARS, HANDOFF_TRANSCRIPT_MAX_CHARS, INJECTION_PREAMBLE, LLM_TIMEOUT_MS, MAIN_FILE, WRITABLE_FILES } from "./src/constants.ts";
 import { isTrivialSession, runReview, serializeTranscript } from "./src/extractor.ts";
 import { runHandoff } from "./src/handoff.ts";
+import { materializeAll, type LayerStats } from "./src/indexer.ts";
+import { MAX_KEYWORDS, MAX_KEYWORDS_PER_LAYER, sanitizeKeywords } from "./src/keywords.ts";
 import { formatSearchResult, loadAllEntries, searchEntries } from "./src/search.ts";
 import { SnapshotManager } from "./src/snapshot.ts";
+import { Debouncer, FileMutex, ProcessLock, appendEntry, isWritableTarget } from "./src/store.ts";
 import { countTurnsFromBranch } from "./src/turns.ts";
-import { Debouncer, FileMutex, ProcessLock, appendEntry, isWritableTarget, mainCleanLength } from "./src/store.ts";
 import type { Layer, SearchMode } from "./src/types.ts";
 
 export default function piMemoryAuto(pi: ExtensionAPI) {
@@ -33,20 +39,63 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 	let projectRoot = process.cwd();
 	let projectName = path.basename(projectRoot);
 	let reviewInFlight = false;
-	const consolidator = new Consolidator({ globalDir: config.globalDir, projectRoot, mutex, llmMaxTokens: config.llmMaxTokens });
+	let consolidationInFlight = false;
+	/** Highest `sinceLast` already sent to consolidation, per layer (avoids
+	 *  re-running on every rebuild when the LLM finds nothing to merge). */
+	const attemptedAt: Record<Layer, number> = { global: -1, project: -1 };
+	let ctxRef: ExtensionContext | undefined;
 
-	/** Count conversation turns from the session branch (stateless).
-	 *  Turn = one user + one assistant message exchange. Compaction entries are
-	 *  not messages, but the history before them stays in the branch, so all
-	 *  prior turns are included. Survives reload/resume naturally. */
+	const indexDeps = () => ({ globalDir: config.globalDir, projectRoot, mutex, indexBudget: config.indexBudget, projectName });
+	const writeDeps = () => ({ globalDir: config.globalDir, projectRoot, mutex, plock: new ProcessLock(config.globalDir), llmMaxTokens: config.llmMaxTokens });
+
+	/** Count conversation turns from the session branch (stateless). */
 	function countTurns(ctx: ExtensionContext): number {
 		return countTurnsFromBranch(ctx.sessionManager.getBranch() as never);
+	}
+
+	function modelInfo(ctx: ExtensionContext) {
+		return { model: ctx.model, registry: ctx.modelRegistry };
+	}
+
+	/**
+	 * Rebuild MEMORY.md keyword tables, then run a consolidation round when a
+	 * layer has accumulated `consolidateEvery` new memories.
+	 */
+	async function refreshIndexes(ctx: ExtensionContext, opts: { resetCounter?: boolean } = {}): Promise<void> {
+		const stats = await materializeAll(indexDeps(), opts);
+		maybeConsolidate(ctx, stats);
+	}
+
+	function maybeConsolidate(ctx: ExtensionContext, stats: { global: LayerStats; project: LayerStats }): void {
+		if (consolidationInFlight) return;
+		const due = (["global", "project"] as const).filter(
+			(layer) => stats[layer].sinceLast >= config.consolidateEvery && stats[layer].sinceLast > attemptedAt[layer],
+		);
+		if (due.length === 0) return;
+		const { model, registry } = modelInfo(ctx);
+		if (!model || !registry) return;
+		for (const layer of due) attemptedAt[layer] = stats[layer].sinceLast;
+
+		consolidationInFlight = true;
+		void loadAllEntries(config.globalDir, projectRoot)
+			.then((entries) => runConsolidation(writeDeps(), entries, model, registry, CONSOLIDATION_TIMEOUT_MS))
+			.then(async (result) => {
+				if (result.noop) return;
+				// Merges shrink the entry count, so reset the watermark explicitly.
+				await refreshIndexes(ctx, { resetCounter: true });
+				if (ctx.hasUI) {
+					ctx.ui.notify(`memory-auto: consolidated ${result.removed} merged memories`, "info");
+				}
+			})
+			.catch(() => undefined)
+			.finally(() => {
+				consolidationInFlight = false;
+			});
 	}
 
 	/** Build the existing-memories digest (recent entries, for review dedup). */
 	async function existingMemoriesDigest(): Promise<string> {
 		const all = await loadAllEntries(config.globalDir, projectRoot);
-		// Newest first, drop empty text, cap to a fixed char budget.
 		const lines: string[] = [];
 		let total = 0;
 		const sorted = all.sort((a, b) => (a.entry.time < b.entry.time ? 1 : -1));
@@ -74,33 +123,16 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 
 		reviewInFlight = true;
 		void existingMemoriesDigest()
-			.then((existingMemories) =>
-				runReview(
-					{ globalDir: config.globalDir, projectRoot, mutex, plock: new ProcessLock(config.globalDir), llmMaxTokens: config.llmMaxTokens },
-					transcript,
-					model,
-					registry,
-					timeoutMs,
-					existingMemories,
-				))
+			.then((existingMemories) => runReview(writeDeps(), transcript, model, registry, timeoutMs, existingMemories))
 			.then((written) => {
-				if (written.length > 0 && ctx.hasUI) ctx.ui.notify(`memory-auto: saved ${written.length} memory entries`, "info");
+				if (written.length === 0) return;
+				void refreshIndexes(ctx);
+				if (ctx.hasUI) ctx.ui.notify(`memory-auto: saved ${written.length} memory entries`, "info");
 			})
 			.catch(() => undefined)
 			.finally(() => {
 				reviewInFlight = false;
 			});
-	}
-
-	/** Schedule a consolidation for a layer if not already pending/in-flight. */
-	function scheduleConsolidation(ctx: ExtensionContext, layer: Layer): void {
-		const { model, registry } = modelInfo(ctx);
-		if (model && registry) consolidator.schedule(layer, model, registry, (k, fn, ms) => debouncer.schedule(k, fn, ms));
-	}
-
-	// Session model access helper (model may be undefined early).
-	function modelInfo(ctx: ExtensionContext) {
-		return { model: ctx.model, registry: ctx.modelRegistry };
 	}
 
 	// ── Tools ────────────────────────────────────────────────────────────────
@@ -109,17 +141,19 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 		name: "memory_search",
 		label: "Memory Search",
 		description: [
-			"Search long-term memories (global + current project). Entries are returned with metadata (id, time, file, source, tags).",
+			"The injected memory index is a table of unique KEYWORDS — the memory bodies are NOT in context. Call this tool when the current task touches any keyword (including a synonym, translation, or the user's own wording for it), then read the returned entries.",
+			"Query tips: pass the index keyword plus related terms you know — synonyms, Chinese/English equivalents, file names, library or tool names. Multi-word queries match on ANY word and rank by how many words matched, so extra terms help.",
 			"Modes:",
-			"- keyword (default): regex/substring match on entry text and tags. Best for concrete terms, symbols, paths, error strings.",
-			"- tag: match entries by tag (comma-separated, e.g. \"auth,db\"). Best when a #tag exists for the topic.",
-			"- recent: newest entries first. Best for recalling what happened lately without a concrete query.",
-			"- all (fused): combines keyword + tag + recency. Best for broad exploratory queries.",
-			"Results are paginated (page size 10). Use page=N for more. Never guess memory contents — search instead.",
+			"- keyword (default): token match on entry text and keywords, ranked by coverage then recency. Falls back to newest entries when nothing matches.",
+			"- tag: exact keyword lookup on the canonical keyword (ignores case and separators, so serializeConversation == serialize-conversation). This is the mode for a keyword copied from the index.",
+			"- recent: newest entries first. Use when the keyword may be stored under different wording.",
+			"- all (fused): keyword + tag + a stronger recency term. Good first try for exploratory questions.",
+			"- id: exact entry id, for \"show me that entry again\".",
+			"Results are paginated (page size 10) — follow page=N when hasMore. Never guess memory contents — search instead.",
 		].join("\n"),
 		parameters: Type.Object({
-			query: Type.Optional(Type.String({ description: "Search query: keywords, regex, or tags depending on mode." })),
-			mode: Type.Optional(StringEnum(["keyword", "tag", "recent", "all"] as const, { description: "Search mode. Default: keyword." })),
+			query: Type.Optional(Type.String({ description: "Search query: keywords, tags, or an entry id depending on mode." })),
+			mode: Type.Optional(StringEnum(["keyword", "tag", "recent", "all", "id"] as const, { description: "Search mode. Default: keyword." })),
 			page: Type.Optional(Type.Number({ description: "1-based page number. Default: 1." })),
 		}),
 		annotations: { readOnlyHint: true },
@@ -131,8 +165,8 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 			const text = formatSearchResult(result, mode, params.query ?? "");
 			return {
 				content: [{ type: "text" as const, text }],
-				details: { summary: `${result.hits.length}/${result.total} memories`, mode, page, total: result.total },
-				structuredContent: { total: result.total, page, hasMore: result.hasMore, hits: result.hits.map((h) => ({ ...h.entry, file: h.file })) },
+				details: { summary: `${result.hits.length}/${result.total} memories`, mode, page, total: result.total, fallback: result.fallback },
+				structuredContent: { total: result.total, page, hasMore: result.hasMore, fallback: result.fallback, hits: result.hits.map((h) => ({ ...h.entry, file: h.file })) },
 			};
 		},
 	});
@@ -141,11 +175,12 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 		name: "memory_write",
 		label: "Memory Write",
 		description: [
-			"Save a durable memory for future sessions. Appends one entry with metadata (time, project, source, tags) to a category file.",
+			"Save a durable memory for future sessions. Appends one entry to a category file and adds its keywords to the layer's MEMORY.md index.",
+			"Keywords (1-3, required): they are the ONLY thing a future session sees in its memory index, and they are how it finds this entry again. Pick the terms that session would search for — include the user's language AND the English equivalent when they differ (e.g. \"部署\", \"deploy\"), plus file names, library names, or error strings. Reuse an existing keyword when it fits. Each keyword: at most 8 Chinese characters or 8 english words.",
 			"Classification guide (follow strictly):",
 			CLASSIFICATION_RUBRIC,
 			"Notes:",
-			"- You CANNOT write the main memory files (MEMORY.md); they are consolidated automatically in the background.",
+			"- You cannot write the index file (MEMORY.md); it is generated from the entries.",
 			"- Before writing, use memory_search to check for duplicates; do not re-store equivalent entries.",
 			"- Never store secrets, API keys, or tokens.",
 		].join("\n"),
@@ -153,34 +188,46 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 			layer: StringEnum(["global", "project"] as const, { description: "global: true across repos. project: specific to this repo. Undecided → project." }),
 			file: StringEnum([...WRITABLE_FILES.global, ...WRITABLE_FILES.project] as [string, ...string[]], { description: "Category file: USER, TOOLING, LESSONS (global); CONVENTIONS, DECISIONS, FAILURES (project)." }),
 			text: Type.String({ description: "The memory text. Concise, self-contained, durable. One entry." }),
-			tags: Type.Optional(Type.Array(Type.String(), { description: "Optional tags for later retrieval." })),
+			tags: Type.Array(Type.String(), {
+				minItems: 1,
+				maxItems: MAX_KEYWORDS,
+				description: "1-3 retrieval keywords: what a future session would search for. Bilingual when the languages differ.",
+			}),
 		}),
 		execute: async (_id, params) => {
 			const layer = params.layer as Layer;
 			if (!isWritableTarget(layer, params.file)) {
 				return {
-					content: [{ type: "text" as const, text: `Invalid target: ${layer}/${params.file}.md is not writable. Category files only — main files (${MAIN_FILE}) are maintained automatically.` }],
+					content: [{ type: "text" as const, text: `Invalid target: ${layer}/${params.file}.md is not writable. Category files only — the index file (${MAIN_FILE}) is generated automatically.` }],
 					details: { summary: "write rejected" },
 					isError: true,
 				};
 			}
+			const { keywords, issues } = sanitizeKeywords(params.tags);
+			if (issues.length > 0) {
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: `Keyword rejected:\n${issues.map((i) => `- ${i}`).join("\n")}\n\nRules: 1-${MAX_KEYWORDS} keywords per memory; each at most 8 Chinese characters or 8 english words; no duplicates. Send the call again with corrected keywords.`,
+						},
+					],
+					details: { summary: "keywords rejected" },
+					isError: true,
+				};
+			}
 			const entry = await appendEntry({ layer, file: params.file as never }, params.text, {
-				tags: params.tags ?? [],
+				tags: keywords,
 				source: "user",
 				globalDir: config.globalDir,
 				projectRoot,
 				mutex,
 				plock: new ProcessLock(config.globalDir),
 			});
-			// Main-file growth check triggers consolidation (project layer only
-			// when the write went to the project layer; global likewise).
-			const cleanedLen = await mainCleanLength(layer, config.globalDir, projectRoot);
-			if (cleanedLen >= config.consolidateThreshold) {
-				const { model, registry } = modelInfo(ctxRef!);
-				if (model && registry) scheduleConsolidation(ctxRef!, layer);
-			}
+			if (ctxRef) void refreshIndexes(ctxRef);
+			else void materializeAll(indexDeps());
 			return {
-				content: [{ type: "text" as const, text: `Saved to ${layer}/${params.file}.md [${entry.id}] ${entry.time} tags: ${entry.tags.join(",") || "-"}` }],
+				content: [{ type: "text" as const, text: `Saved to ${layer}/${params.file}.md [${entry.id}] ${entry.time} keywords: ${entry.tags.join(",")}` }],
 				details: { summary: `saved ${layer}/${params.file}.md`, entryId: entry.id } as { summary: string; entryId?: string },
 			};
 		},
@@ -188,27 +235,26 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 
 	// ── Lifecycle ────────────────────────────────────────────────────────────
 
-	let ctxRef: ExtensionContext | undefined;
-
 	pi.on("session_start", async (_event, ctx) => {
 		ctxRef = ctx;
 		projectRoot = ctx.cwd;
 		projectName = path.basename(projectRoot);
 		snapshots.reset();
+		// Keep the derived MEMORY.md keyword tables in sync (creates them the
+		// first time) and catch up on a consolidation that was due before exit.
+		void refreshIndexes(ctx);
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		ctxRef = ctx;
 		try {
-			const { text: injected, overflowedLayers } = await snapshots.getInjection({
+			const injected = await snapshots.getInjection({
 				globalDir: config.globalDir,
 				projectRoot,
 				preamble: INJECTION_PREAMBLE,
-				budget: config.renderBudget,
+				indexBudget: config.indexBudget,
+				projectName,
 			});
-			// Render overflow means tail entries were dropped at injection time;
-			// schedule a consolidation so stale content is pruned at the source.
-			for (const layer of overflowedLayers) scheduleConsolidation(ctx, layer);
 			if (injected && injected.length > 0) {
 				return { systemPrompt: event.systemPrompt + "\n\n" + injected };
 			}
@@ -222,7 +268,6 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 		ctxRef = ctx;
 		// Stateless trigger: count total turns from the branch each turn;
 		// extract at every multiple of reviewTurns (e.g. 8 → turns 8, 16, 24...).
-		// Includes turns before compaction; survives reload/resume (no counter to lose).
 		if (countTurns(ctx) % config.reviewTurns !== 0 || reviewInFlight) return;
 		scheduleReview(ctx);
 		return undefined;
@@ -231,27 +276,26 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 	pi.on("session_before_compact", async (event, ctx) => {
 		ctxRef = ctx;
 		snapshots.markCompacted(); // re-inject after compaction (free cache boundary)
-		// Fire-and-forget handoff so important state survives compaction.
 		const { model, registry } = modelInfo(ctx);
 		if (model && registry) {
-			// pi's compaction path exposes convertToLlm-able AgentMessages; use the
-			// full serialized view (tool calls + truncated tool results included).
 			const transcript = serializeTranscript([...event.preparation.messagesToSummarize].slice(-HANDOFF_TRANSCRIPT_MAX_CHARS));
-			void runHandoff({ globalDir: config.globalDir, projectRoot, mutex, plock: new ProcessLock(config.globalDir), llmMaxTokens: config.llmMaxTokens }, transcript, model, registry).catch(
-				() => undefined,
-			);
+			void runHandoff(writeDeps(), transcript, model, registry)
+				.then((written) => {
+					if (written.length > 0) void refreshIndexes(ctx);
+				})
+				.catch(() => undefined);
 		}
 		return undefined; // don't customize compaction itself
 	});
 
-	// Exit flush: when the user quits the session, run one final extraction so
-	// the tail of the conversation (turns since the last multiple trigger) is
-	// not lost. pi awaits session_shutdown handlers before exiting. reload/new/
-	// resume/fork do not flush (runtime teardown, not end of conversation).
-	// Short self-timeout so quitting never hangs.
+	// Exit flush: one final extraction so the tail of the conversation is not
+	// lost. reload/new/resume/fork do not flush (runtime teardown, not the end
+	// of a conversation). Short self-timeout so quitting never hangs.
 	pi.on("session_shutdown", async (event, ctx) => {
-		debouncer.clearAll();
-		if (event.reason !== "quit") return;
+		if (event.reason !== "quit") {
+			debouncer.clearAll();
+			return;
+		}
 		try {
 			scheduleReview(ctx, SHUTDOWN_FLUSH_TIMEOUT_MS);
 		} catch {
@@ -259,13 +303,10 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 		}
 	});
 
-	// Silence unused warnings for names kept for clarity.
-	void projectName;
-	void PROJECT_CATEGORY_FILES;
-	void GLOBAL_CATEGORY_FILES;
+	void MAX_KEYWORDS_PER_LAYER; // documented cap, enforced in index-map.ts
 }
 
-// Local import kept at bottom to avoid top-level name clash in the factory.
+// Local import kept at bottom to avoid a top-level name clash in the factory.
 import path from "node:path";
 
 /** Max time the quit-flush review may take; keeps session exit snappy. */

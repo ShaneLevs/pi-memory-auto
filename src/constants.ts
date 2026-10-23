@@ -24,19 +24,17 @@ export const PROJECT_DIR = ".pi/agent/memory-auto";
 
 // ── Budgets ─────────────────────────────────────────────────────────────────
 
-/** Rendered per-main-file character budget (injection). */
-export const RENDER_BUDGET = 1000;
-
-/** Cleaned main-file length (chars) that triggers background consolidation. */
-export const CONSOLIDATE_THRESHOLD = 1000;
+/** Default character budget for the injected keyword table (per layer).
+ *  Keyword lines are short (~14 chars), so this fits the 200-keyword cap. */
+export const INDEX_BUDGET = 3000;
 
 /** Search results page size. */
 export const PAGE_SIZE = 10;
 
-/** Debounce window (ms) for background writes (consolidation scheduling). */
+/** Debounce window (ms) for background writes (index refresh scheduling). */
 export const WRITE_DEBOUNCE_MS = 5000;
 
-/** Self-timeout (ms) for background LLM calls (review/consolidation). */
+/** Self-timeout (ms) for background LLM calls (review / handoff). */
 export const LLM_TIMEOUT_MS = 120_000;
 /** Sessions with fewer valid messages than this are skipped by auto-extraction. */
 export const MIN_MESSAGES_FOR_REVIEW = 4;
@@ -123,9 +121,17 @@ Example: "use pnpm, not npm" — a cross-project user habit goes to global TOOLI
 | DECISIONS.md | architecture/tech choices with rationale | undecided alternatives |
 | FAILURES.md | project-specific pitfalls, failures, corrections (default for project auto-extraction) | general lessons (go to LESSONS) |`;
 
-/** Short usage preamble injected before the rendered main memories. */
+/**
+ * Injected index preamble: what the block is and when to search.
+ * Written as a trigger list, not a passive description — retrieval only happens
+ * if the model recognizes the moment it should search.
+ */
 export const INJECTION_PREAMBLE = `<memory-auto>
-Below are your condensed memories (global, then project for the current repo). Treat them as background context; the user's current request, repository files, and tool outputs override them.
+This is the memory index: one line per KEYWORD from a past session. The memory bodies are NOT in context.
 
-Use memory_search to retrieve details (keyword/tag/recent/all modes, paginated). Use memory_write to save new durable memories — it can only write category files, never these main files; the main files are consolidated automatically in the background.
+When the current task touches any keyword below — including a synonym, a translation, or the user's own wording for it — call memory_search with mode:"tag" and that keyword BEFORE acting, answering, or asking the user. Add related terms you know (other languages, file names, tool names) to widen the search.
+
+The number in parentheses is how many memories share that keyword. "(+N more keywords)" means the table was truncated — use mode:"recent" for the newest memories.
+
+Never guess stored content. If nothing matches, say so instead of inventing it. memory_write requires 1-3 keywords: they are what future sessions will see.
 </memory-auto>`;

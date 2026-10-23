@@ -1,7 +1,7 @@
 {
   "name": "@shanelevs/pi-memory-auto",
-  "version": "0.3.0",
-  "description": "🧠 Memory extension for the pi coding agent — two-layer markdown memory (global + project), cache-safe snapshot injection, keyword/tag/recent search, turn-based auto-extraction, auto-consolidation. Zero heavy deps.",
+  "version": "0.5.0",
+  "description": "🧠 Memory extension for the pi coding agent — memories stored as body + 1-3 keywords, a unique keyword table injected into every session, keyword lookup the agent drives itself, duplicate-merging consolidation every N memories. Zero heavy deps.",
   "type": "module",
   "main": "index.ts",
   "license": "MIT",
@@ -21,7 +21,7 @@
     "persistent-memory",
     "agent-memory",
     "two-tier-memory",
-    "snapshot-injection",
+    "memory-index",
     "markdown"
   ],
   "pi": {
@@ -32,17 +32,23 @@
   "files": [
     "index.ts",
     "src",
+    "scripts",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
     "test": "node --experimental-strip-types --test test/*.test.ts",
     "typecheck": "tsc --noEmit",
+    "index:rebuild": "node --experimental-strip-types scripts/rebuild-index.ts",
     "prepublishOnly": "npm run typecheck && npm test"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "typescript": "^7.0.2"
   }
 }

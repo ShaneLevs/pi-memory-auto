@@ -5,58 +5,75 @@ import path from "node:path";
 import { test } from "node:test";
 import { SnapshotManager } from "../src/snapshot.ts";
 
-async function makeDir(): Promise<string> {
-	return fs.mkdtemp(path.join(os.tmpdir(), "pi-memory-auto-snap-"));
-}
-
 const PREAMBLE = "<memory-auto>preamble</memory-auto>";
-const BUDGET = 100;
+const BUDGET = 400;
 
-function writeMain(dir: string, layer: "global" | "project", content: string): Promise<void> {
-	const sub = layer === "project" ? path.join(dir, "proj", ".pi", "agent", "memory-auto") : dir;
-	return (async () => {
-		await fs.mkdir(sub, { recursive: true });
-		await fs.writeFile(path.join(sub, "MEMORY.md"), content, "utf8");
-	})();
+function meta(id: string, tags: string, project: string): string {
+	return `<!-- mid: ${id} | t: 2026-10-11 19:40:00 | p: ${project} | src: auto | tags: ${tags} -->`;
 }
 
-const PROJECT_ROOT = "/tmp/proj"; // matches mainFilePath("project", ...) layout in the test below
+async function dirs(): Promise<{ globalDir: string; projectRoot: string }> {
+	const globalDir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-mem-global-"));
+	const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), "pi-mem-proj-"));
+	return { globalDir, projectRoot };
+}
 
-// Note: project main path = <projectRoot>/.pi/agent/memory-auto/MEMORY.md.
-// The projectRoot used by getInjection is passed directly, so we create a temp dir and pass it.
+async function writeCategory(root: string, file: string, body: string): Promise<void> {
+	const dir = path.join(root, ".pi", "agent", "memory-auto");
+	await fs.mkdir(dir, { recursive: true });
+	await fs.writeFile(path.join(dir, file), body, "utf8");
+}
 
-test("getInjection: no overflow when content fits budget", async () => {
-	const dir = await makeDir();
-	await writeMain(dir, "global", "Short global memory.");
-	const proj = await makeDir();
-	await writeMain(proj, "project", "Short project memory.");
+test("no entries → no injection", async () => {
+	const { globalDir, projectRoot } = await dirs();
 	const snapshots = new SnapshotManager();
-	const r = await snapshots.getInjection({ globalDir: dir, projectRoot: proj, preamble: PREAMBLE, budget: BUDGET });
-	assert.ok(r.text!.includes("Short global memory."));
-	assert.deepEqual(r.overflowedLayers, []);
+	const text = await snapshots.getInjection({ globalDir, projectRoot, preamble: PREAMBLE, indexBudget: BUDGET });
+	assert.equal(text, "");
 });
 
-test("getInjection: overflowing layer reported", async () => {
-	const dir = await makeDir();
-	await writeMain(dir, "global", "x".repeat(BUDGET + 50));
-	const proj = await makeDir();
-	await writeMain(proj, "project", "short");
+test("index is produced from category files alone (no MEMORY.md needed)", async () => {
+	const { globalDir, projectRoot } = await dirs();
+	await fs.writeFile(path.join(globalDir, "USER.md"), `${meta("20261001-aaaa", "language,中文", "-")}\nPrefers Chinese, terse answers.\n`, "utf8");
+	await writeCategory(projectRoot, "DECISIONS.md", `${meta("20261002-bbbb", "pnpm,包管理器", "proj")}\nUse pnpm, not npm.\n`);
 	const snapshots = new SnapshotManager();
-	const r = await snapshots.getInjection({ globalDir: dir, projectRoot: proj, preamble: PREAMBLE, budget: BUDGET });
-	assert.deepEqual(r.overflowedLayers, ["global"]);
-	// Injected text is still trimmed to the budget.
-	assert.ok(r.text!.length <= BUDGET + PREAMBLE.length + 100);
+	const text = await snapshots.getInjection({ globalDir, projectRoot, preamble: PREAMBLE, indexBudget: BUDGET });
+	assert.ok(text);
+	assert.ok(text!.includes("#language"));
+	assert.ok(text!.includes("#pnpm"));
+	// Only keywords are injected — never the memory bodies.
+	assert.ok(!text!.includes("Use pnpm, not npm."));
+	assert.ok(!text!.includes("Prefers Chinese"));
+	assert.ok(text!.includes("global — 1 memory"));
+	assert.ok(text!.includes("project:"));
 });
 
-test("getInjection: snapshot reuse returns no overflow again", async () => {
-	const dir = await makeDir();
-	await writeMain(dir, "global", "y".repeat(BUDGET + 50));
-	const proj = await makeDir();
+test("snapshot is reused within a session (returns null, cache-safe)", async () => {
+	const { globalDir, projectRoot } = await dirs();
+	await writeCategory(projectRoot, "FAILURES.md", `${meta("20261001-aaaa", "x", "proj")}\nbody\n`);
 	const snapshots = new SnapshotManager();
-	const first = await snapshots.getInjection({ globalDir: dir, projectRoot: proj, preamble: PREAMBLE, budget: BUDGET });
-	assert.deepEqual(first.overflowedLayers, ["global"]);
-	// Second call reuses the snapshot: no re-render, no overflow re-report.
-	const second = await snapshots.getInjection({ globalDir: dir, projectRoot: proj, preamble: PREAMBLE, budget: BUDGET });
-	assert.equal(second.text, null);
-	assert.deepEqual(second.overflowedLayers, []);
+	const first = await snapshots.getInjection({ globalDir, projectRoot, preamble: PREAMBLE, indexBudget: BUDGET });
+	assert.ok(first && first.length > 0);
+	const second = await snapshots.getInjection({ globalDir, projectRoot, preamble: PREAMBLE, indexBudget: BUDGET });
+	assert.equal(second, null);
+});
+
+test("compaction dirties the snapshot; new entries show up after it", async () => {
+	const { globalDir, projectRoot } = await dirs();
+	await writeCategory(projectRoot, "FAILURES.md", `${meta("20261001-aaaa", "old-topic", "proj")}\nbody\n`);
+	const snapshots = new SnapshotManager();
+	await snapshots.getInjection({ globalDir, projectRoot, preamble: PREAMBLE, indexBudget: BUDGET });
+	await writeCategory(projectRoot, "FAILURES.md", `${meta("20261001-aaaa", "old-topic", "proj")}\nbody\n\n${meta("20261002-bbbb", "new-topic", "proj")}\nother\n`);
+	snapshots.markCompacted();
+	const text = await snapshots.getInjection({ globalDir, projectRoot, preamble: PREAMBLE, indexBudget: BUDGET });
+	assert.ok(text!.includes("#new-topic"));
+});
+
+test("reset() forces a re-render (session start)", async () => {
+	const { globalDir, projectRoot } = await dirs();
+	await writeCategory(projectRoot, "FAILURES.md", `${meta("20261001-aaaa", "x", "proj")}\nbody\n`);
+	const snapshots = new SnapshotManager();
+	await snapshots.getInjection({ globalDir, projectRoot, preamble: PREAMBLE, indexBudget: BUDGET });
+	snapshots.reset();
+	const text = await snapshots.getInjection({ globalDir, projectRoot, preamble: PREAMBLE, indexBudget: BUDGET });
+	assert.ok(text && text.length > 0);
 });
