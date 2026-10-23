@@ -6,6 +6,10 @@ Every memory is stored as **a body plus 1–3 keywords**. The keywords go into a
 
 ## Changelog
 
+### 0.7.1
+
+- **`/memory compact` (and the automatic round) now examines the whole store, not just the newest 120 memories.** It used to send one prompt capped at 120 and silently leave everything older unexamined — forever, since every later round again took the newest 120. A duplicate between a fresh memory and an old one, the most common case, could therefore never be found. The pass now pages through the store (120 per call, newest first), re-reading the entries after each page that changed them, and stops early only when the provider fails. `ConsolidationResult.rounds` reports how many calls it took.
+
 ### 0.7.0
 
 - **`/memory rebuild` now re-derives keywords with the model.** The index is the only memory content that enters the context window, so a stale or bloated keyword costs a memory its reachability. Rebuild sends every entry (batched, ids + current keywords + body) to the session model, validates the answer against the 1–3 / ≤8 rule, writes the surviving keywords back into the entry metadata (`.bak` kept), then regenerates `MEMORY.md`. Unusable answers keep the stored keywords; if the model fails entirely, the stored tags are repaired deterministically. Costs `ceil(entries / 12)` LLM calls, so it is a command, never background work.
@@ -15,10 +19,6 @@ Every memory is stored as **a body plus 1–3 keywords**. The keywords go into a
 - **Compaction handoff transcript is capped by characters.** It used to slice the message *array* by a character budget, which kept an arbitrary number of messages.
 - **Truncated entries can no longer be stored.** `stopReason: "length"` covers providers that report truncation, but a response can still arrive looking successful while one entry inside it is cut — the real global store carried a half sentence with a dangling code span for months. `src/integrity.ts` now rejects text with an unclosed code span, an excess of `(`/`[`/`{`, or a trailing opening delimiter. Delimiter counting runs on the prose outside code spans, so shell snippets and regexes do not trip it; auto-extraction silently drops such an entry (the next round retries), `memory_write` rejects it with an actionable message.
 - Dead code removed (`Debouncer`, `WRITE_DEBOUNCE_MS`, `cleanMainContent`, `mainCleanLength`, `SnapshotManager.hasSnapshot`, `AppendResult`).
-
-### 0.6.0
-
-- New `/memory` command: `show` (keyword index + watermark), `compact` (merge duplicates now, regardless of the threshold), `rebuild` (regenerate `MEMORY.md`). Argument completion included.
 
 ## Model
 
@@ -141,11 +141,14 @@ project: myrepo — 9 memories, 17 keywords
 
 Triggered when a layer has accumulated `PI_MEMORY_AUTO_CONSOLIDATE_EVERY` new memories (checked after every rebuild, including at session start, so a round that was due before exit is caught up).
 
-1. The model receives id / layer / keywords / body for the stored memories and proposes `===MERGE===` (keep one, drop duplicates, optional merged text/keywords) and `===RENAME===` (keyword synonym) blocks.
-2. Every proposal is validated against the entries that actually exist: unknown ids ignored, merges never span layers, self-merges dropped, keywords re-checked against the 1–3 / ≤8 rule, and a memory never ends up without a keyword.
-3. The plan is applied deterministically (rewriting only the files it touches, `.bak` kept) and the watermark is reset.
+1. The store is examined in **pages of 120 memories**, newest first. Every memory is seen exactly once per pass; a page with nothing to merge just moves on to the next page. Merges remove ids, so the store is re-read before the next page. A failed call ends the pass (whatever was already applied stays applied).
+2. For each page the model receives id / layer / keywords / body and proposes `===MERGE===` (keep one, drop duplicates, optional merged text/keywords) and `===RENAME===` (keyword synonym) blocks.
+3. Every proposal is validated against the entries that actually exist: unknown ids ignored, merges never span layers, self-merges dropped, keywords re-checked against the 1–3 / ≤8 rule, and a memory never ends up without a keyword.
+4. The plan is applied deterministically (rewriting only the files it touches, `.bak` kept) and the watermark is reset.
 
 Failure is safe: if the model proposes nothing usable, the store is untouched and the table is still rebuilt deterministically.
+
+Pages are time-ordered, so two duplicates that land in *different* pages cannot be merged in the same pass — the residual gap of paging. Keyword-clustered pages would close it at the cost of a different page order.
 
 ### Retrieval
 

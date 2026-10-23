@@ -22,10 +22,14 @@ import { GLOBAL_CATEGORY_FILES, PROJECT_CATEGORY_FILES, LLM_TIMEOUT_MS } from ".
 import { sanitizeKeywords } from "./keywords.ts";
 import { completeWithSessionModel } from "./llm.ts";
 import { applyConsolidation, type ApplyDeps, type ConsolidationPlan, type KeywordRename, type MergeOp } from "./store.ts";
+import { loadAllEntries } from "./search.ts";
 import type { Layer, MemoryEntry, WriteTarget } from "./types.ts";
 
-/** Max memories given to the LLM in one consolidation round. */
+/** Max memories sent in ONE LLM call. Larger stores are covered over several
+ *  rounds — see runConsolidation. */
 const MAX_ENTRIES_IN_PROMPT = 120;
+/** Safety cap on rounds per invocation (120 × 12 = 1440 memories in one run). */
+const MAX_ROUNDS = 12;
 /** Max merged groups accepted from one response. */
 const MAX_MERGES = 40;
 /** Max keyword renames accepted from one response. */
@@ -68,9 +72,17 @@ export interface ConsolidationResult {
 	updated: number;
 	/** True when the LLM proposed nothing usable (store untouched). */
 	noop: boolean;
+	/** LLM calls made (one per page of entries). */
+	rounds: number;
 }
 
-/** Build the user prompt for one consolidation round. */
+/**
+ * Build the user prompt for one page of entries.
+ *
+ * `limit` is a guard: a caller that forgot to page cannot send a huge prompt.
+ * Covering the rest of the store is the caller's job — see runConsolidation,
+ * which pages through everything.
+ */
 export function buildConsolidationPrompt(entries: { entry: MemoryEntry; file: string }[], limit = MAX_ENTRIES_IN_PROMPT): string {
 	const sorted = [...entries].sort((a, b) => (a.entry.time < b.entry.time ? 1 : -1));
 	const shown = sorted.slice(0, limit);
@@ -78,7 +90,7 @@ export function buildConsolidationPrompt(entries: { entry: MemoryEntry; file: st
 		const kw = entry.tags.length > 0 ? entry.tags.join(", ") : "(none)";
 		return `[${entry.id}] ${entry.layer} ${file} | keywords: ${kw}\n${entry.text}`;
 	});
-	const note = sorted.length > shown.length ? `\n\n(${sorted.length - shown.length} older memories omitted from this round.)` : "";
+	const note = sorted.length > shown.length ? `\n\n(${sorted.length - shown.length} older memories omitted from this prompt.)` : "";
 	return `<memories>\n${lines.join("\n\n")}\n</memories>${note}\n\nRespond with merge/rename blocks, or NOTHING_TO_MERGE.`;
 }
 
@@ -143,7 +155,29 @@ function filesForLayer(layer: Layer): readonly string[] {
 }
 
 /**
- * Run one consolidation round over all entries.
+ * Run a consolidation pass over the WHOLE store, paging through it.
+ *
+ * Earlier versions sent only the newest 120 memories in a single call and
+ * silently left the rest unexamined forever — so a duplicate between a fresh
+ * memory and an old one (the common case: the same fact re-recorded months
+ * later) could never be found. Now:
+ *
+ * - each round sends at most MAX_ENTRIES_IN_PROMPT memories (newest first) to
+ *   the LLM, and a page with nothing to merge just moves on to the next page;
+ * - every examined id is remembered, so each round takes the next page of
+ *   memories that have not been looked at yet;
+ * - after a round that changed the store the entries are re-read, because
+ *   merges removed ids and renames changed keywords for the next page.
+ *
+ * A failed call ends the pass (the store keeps whatever was already applied),
+ * and MAX_ROUNDS bounds one invocation.
+ *
+ * Known limitation: pages are time-ordered, so two duplicates that land in
+ * DIFFERENT pages are never shown to the model together. This is far narrower
+ * than the old behaviour (where everything past the newest 120 was invisible),
+ * but it is not zero. Making pages keyword-clustered instead would close it, at
+ * the cost of a different page order.
+ *
  * Never throws; returns counts of what actually changed.
  */
 export async function runConsolidation(
@@ -153,42 +187,63 @@ export async function runConsolidation(
 	registry: unknown,
 	timeoutMs?: number,
 ): Promise<ConsolidationResult> {
-	const noop: ConsolidationResult = { changedFiles: 0, removed: 0, updated: 0, noop: true };
-	if (entries.length < 2) return noop;
-
-	const result = await completeWithSessionModel(
-		model as Parameters<typeof completeWithSessionModel>[0],
-		registry as Parameters<typeof completeWithSessionModel>[1],
-		{
-			systemPrompt: CONSOLIDATION_SYSTEM_PROMPT,
-			userPrompt: buildConsolidationPrompt(entries),
-			maxTokens: deps.llmMaxTokens,
-			...(timeoutMs !== undefined ? { timeoutMs } : {}),
-		},
-	);
-	if (!result.ok) return noop;
-	if (/NOTHING_TO_MERGE/.test(result.text) && !result.text.includes("===MERGE===") && !result.text.includes("===RENAME===")) {
-		return noop;
-	}
-
-	const byId = new Map(entries.map(({ entry }) => [entry.id, entry]));
-	const plan = parseConsolidationPlan(result.text, byId);
-	if (plan.merges.length === 0 && plan.keywordRenames.length === 0) return noop;
-
+	let pool = entries;
+	const examined = new Set<string>();
+	let rounds = 0;
 	let changedFiles = 0;
 	let removed = 0;
 	let updated = 0;
-	for (const layer of ["global", "project"] as const) {
-		for (const file of filesForLayer(layer)) {
-			const target: WriteTarget = { layer, file: file as WriteTarget["file"] };
-			const applied = await applyConsolidation(target, deps, plan);
-			if (!applied.changed) continue;
-			changedFiles++;
-			removed += applied.removed;
-			updated += applied.updated;
+
+	while (rounds < MAX_ROUNDS) {
+		const remaining = [...pool]
+			.filter(({ entry }) => !examined.has(entry.id))
+			.sort((a, b) => (a.entry.time < b.entry.time ? 1 : -1));
+		// A single memory has nothing to be merged with.
+		if (remaining.length < 2) break;
+		const page = remaining.slice(0, MAX_ENTRIES_IN_PROMPT);
+		rounds++;
+		for (const { entry } of page) examined.add(entry.id);
+
+		const response = await completeWithSessionModel(
+			model as Parameters<typeof completeWithSessionModel>[0],
+			registry as Parameters<typeof completeWithSessionModel>[1],
+			{
+				systemPrompt: CONSOLIDATION_SYSTEM_PROMPT,
+				userPrompt: buildConsolidationPrompt(page),
+				maxTokens: deps.llmMaxTokens,
+				...(timeoutMs !== undefined ? { timeoutMs } : {}),
+			},
+		);
+		// A failed call means the provider is unhappy; stop instead of hammering it.
+		if (!response.ok) break;
+
+		const nothingToDo =
+			/NOTHING_TO_MERGE/.test(response.text) && !response.text.includes("===MERGE===") && !response.text.includes("===RENAME===");
+		if (nothingToDo) continue; // next page
+
+		const byId = new Map(page.map(({ entry }) => [entry.id, entry]));
+		const plan = parseConsolidationPlan(response.text, byId);
+		if (plan.merges.length === 0 && plan.keywordRenames.length === 0) continue;
+
+		let roundChanged = 0;
+		for (const layer of ["global", "project"] as const) {
+			for (const file of filesForLayer(layer)) {
+				const target: WriteTarget = { layer, file: file as WriteTarget["file"] };
+				const applied = await applyConsolidation(target, deps, plan);
+				if (!applied.changed) continue;
+				changedFiles++;
+				roundChanged++;
+				removed += applied.removed;
+				updated += applied.updated;
+			}
 		}
+		// Nothing was written: no need to re-read, but the page is spent so the
+		// loop still advances. Only reload when ids/keywords actually moved.
+		if (roundChanged === 0) continue;
+		pool = await loadAllEntries(deps.globalDir, deps.projectRoot);
 	}
-	return { changedFiles, removed, updated, noop: changedFiles === 0 };
+
+	return { changedFiles, removed, updated, noop: changedFiles === 0, rounds };
 }
 
 /** Default consolidation cadence (memories added between rounds). */

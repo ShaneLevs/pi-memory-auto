@@ -164,3 +164,100 @@ test("LLM failure leaves the store untouched (no-op)", async () => {
 	assert.equal(result.noop, true);
 	assert.equal(await fs.readFile(file, "utf8"), before);
 });
+
+// ── Pagination: the whole store must be examined, not just the newest page ──
+
+/** Write `count` entries with descending times so entry 0 is the newest. */
+async function writeMany(file: string, count: number): Promise<void> {
+	const blocks: string[] = [];
+	for (let i = 0; i < count; i++) {
+		const id = `2026${String(i).padStart(4, "0")}-aaaa`;
+		const minutes = String(59 - (i % 60)).padStart(2, "0");
+		const hours = String(23 - Math.floor(i / 60)).padStart(2, "0");
+		blocks.push(`${meta(id, `kw${i}`, "proj", `2026-10-11 ${hours}:${minutes}:00`)}body ${i}\n\n`);
+	}
+	await fs.writeFile(file, blocks.join(""), "utf8");
+}
+
+/** Records every prompt sent, replies NOTHING_TO_MERGE. */
+function recordingRegistry() {
+	const prompts: string[] = [];
+	return {
+		prompts,
+		registry: {
+			complete: async (_m: unknown, context: unknown) => {
+				prompts.push(JSON.stringify(context));
+				return { content: [{ type: "text", text: "NOTHING_TO_MERGE" }], stopReason: "stop" };
+			},
+		},
+	};
+}
+
+test("entries beyond the per-call limit are examined in further rounds, not skipped", async () => {
+	const { projectRoot, globalDir, deps } = await setup();
+	const file = path.join(projectRoot, ".pi/agent/memory-auto/DECISIONS.md");
+	// 130 entries: an old fixed limit of 120 would silently drop the oldest 10.
+	await writeMany(file, 130);
+	const entries = await loadAllEntries(globalDir, projectRoot);
+	assert.equal(entries.length, 130);
+
+	const { prompts, registry } = recordingRegistry();
+	const result = await runConsolidation(deps, entries, {}, registry);
+
+	assert.equal(result.rounds, 2);
+	assert.equal(prompts.length, 2);
+	// Every entry appears in exactly one of the prompts.
+	for (let i = 0; i < 130; i++) {
+		const id = `2026${String(i).padStart(4, "0")}-aaaa`;
+		const seen = prompts.filter((p) => p.includes(id)).length;
+		assert.equal(seen, 1, `${id} appeared ${seen} times`);
+	}
+	assert.equal(result.noop, true);
+});
+
+test("a merge on page 1 is re-read before page 2 so ids stay consistent", async () => {
+	const { projectRoot, globalDir, deps } = await setup();
+	const file = path.join(projectRoot, ".pi/agent/memory-auto/DECISIONS.md");
+	// 122 entries: page 1 = 120 newest, page 2 = the 2 oldest.
+	await writeMany(file, 122);
+	const entries = await loadAllEntries(globalDir, projectRoot);
+
+	let call = 0;
+	const registry = {
+		complete: async () => {
+			call++;
+			// First page: merge the two newest entries into one.
+			if (call === 1) {
+				return {
+					content: [{ type: "text", text: "===MERGE===\nKEEP: 20260000-aaaa\nDROP: 20260001-aaaa" }],
+					stopReason: "stop",
+				};
+			}
+			return { content: [{ type: "text", text: "NOTHING_TO_MERGE" }], stopReason: "stop" };
+		},
+	};
+	const result = await runConsolidation(deps, entries, {}, registry);
+	assert.equal(result.removed, 1);
+	assert.equal(result.rounds, 2); // still reached page 2 after the merge
+
+	const after = await loadAllEntries(globalDir, projectRoot);
+	assert.equal(after.length, 121);
+});
+
+test("a failed call stops the pass instead of hammering the provider", async () => {
+	const { projectRoot, globalDir, deps } = await setup();
+	const file = path.join(projectRoot, ".pi/agent/memory-auto/DECISIONS.md");
+	await writeMany(file, 200);
+	const entries = await loadAllEntries(globalDir, projectRoot);
+	let calls = 0;
+	const failing = {
+		complete: async () => {
+			calls++;
+			return { content: [], stopReason: "error" };
+		},
+	};
+	const result = await runConsolidation(deps, entries, {}, failing);
+	assert.equal(calls, 1);
+	assert.equal(result.rounds, 1);
+	assert.equal(result.noop, true);
+});
