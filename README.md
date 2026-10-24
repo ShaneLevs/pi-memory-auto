@@ -75,6 +75,35 @@ Layer scoping is enforced below the command layer too: `runConsolidation` only s
 
 ## How it works
 
+### Lifecycle
+
+Five hooks, in the order a session hits them. None of them can fail the run: every hook swallows its own errors and degrades to "no memory this turn".
+
+| Hook | What runs | Awaited? |
+|---|---|---|
+| `session_start` | Rewrite both `MEMORY.md` tables from the entries, then `maybeConsolidate` — which catches up a round that was due before the last exit | no, the session starts immediately |
+| `before_agent_start` | Re-render the keyword table **only** on the first run and right after compaction; every other run returns nothing, so the prompt bytes stay identical and the prefix cache survives | yes (it builds the prompt) |
+| `turn_end` | Every `REVIEW_TURNS` turns: serialize the conversation, review it, append at most 3 entries, rebuild the index | no, it lands on a later turn |
+| `session_before_compact` | One handoff extraction over the messages being summarized (at most 2 entries), then mark the index for re-render | no, compaction is never delayed |
+| `session_shutdown` | Only for `quit` (never reload/new/resume/fork): one last review of the conversation tail, hard-capped at 30 s and awaited — pi tears the process down right after the handler returns | yes, raced against a timeout |
+
+Turn counting is stateless: the turn number is derived from the session branch on every `turn_end`, so restarts, compaction and forks cannot desynchronise a counter. A session with fewer than 4 messages is never reviewed.
+
+### What happens to a memory
+
+Every mechanism acts on one of these rows:
+
+| Situation | Mechanism | In the index | In search | On disk |
+|---|---|---|---|---|
+| Written again, identical body | `seen`/`last` bumped in place | unchanged | unchanged | one row |
+| Written again, different wording | nothing — it becomes a near-duplicate candidate | both keywords listed | both rows returned | two rows, until a merge |
+| Corrected | `supersedes` → old row gains `superseded-by` | old row's keywords leave | old row ranks last, labelled | old row kept |
+| Not verified for its interval | derived from `last`/`time`, nothing stored | unchanged | ranks below fresh, labelled `stale` | kept |
+| Merged by consolidation | drop rows, keep one, rewrite the file (`.bak` kept) | recomputed | one result | row removed |
+| Layer emptied | `MEMORY.md` deleted | file removed | empty | — |
+
+Only a consolidation merge removes a memory, and only when a model proposed the merge *and* the plan validated against entries that actually exist; everything else is additive state (`seen`, `supersedes`) or a ranking derived from the bodies. The one file that can disappear is a layer's `MEMORY.md`, when its last entry is gone — always because the store behind it is empty.
+
 ### Storage layout
 
 ```
@@ -94,14 +123,14 @@ Layer scoping is enforced below the command layer too: `runConsolidation` only s
 `MEMORY.md`:
 
 ```markdown
-<!-- AUTO-GENERATED keyword table for this layer — one line per unique keyword. … -->
+<!-- AUTO-GENERATED — do not edit. This file is owned entirely by the extension: … -->
 <!-- stats: entries=9 keywords=17 sinceLast=3 lastConsolidated=2026-10-23T10:00:00.000Z -->
 #deploy (3)
 #pnpm
 #serialize-conversation (2)
 ```
 
-The `(n)` is **how many memories use that keyword** — not an entry number. Ranking is `count + recalls` (recalls capped at 4, see the usage log below), then alphabetical: a keyword that several memories share *and* that has actually found something sorts first, so the fixed budget keeps the useful part of the table. `sinceLast` is the consolidation watermark: memories added since the last round.
+The `(n)` is **how many memories use that keyword** — not an entry number. Ordering is `count + min(recalls, 4)`, then `count`, then alphabetical: a keyword that several memories share *and* that has actually found something sorts first, so the fixed budget keeps the useful part of the table. `sinceLast` is the consolidation watermark: memories added since the last round.
 
 ### Entry format
 
@@ -129,9 +158,9 @@ Optional trailing fields (absent in the common case, so a normal entry's bytes s
 | 1–3 per memory | `sanitizeKeywords` on `memory_write` (rejects), `parseReviewResponse` / `runHandoff` (derive or trim), `coerceKeywords` on read + `/memory rebuild` |
 | ≤ 8 Chinese characters or 8 english words | `keywordIssue`; the extractor and rekey prompts state it too |
 | Unique per layer | canonical key = lowercase with separators removed (`src/keywords.ts`) |
-| ≤ 200 per layer | `collectKeywords` cap; the least-used keywords are dropped from the table (their memories stay searchable by text) |
+| ≤ 200 per layer | `collectKeywords` cap; the lowest-ranked keywords (shared count + recalls) are dropped from the table (their memories stay searchable by text) |
 
-Stored tags are repaired on read (`coerceKeywords`): legacy space-separated `#a #b #c` blobs are split back into individual keywords, over-long or invalid ones are dropped, and an entry left with nothing gets a keyword derived from its body. The read path never writes — `/memory rebuild` is what persists the repair. |
+Stored tags are repaired on read (`coerceKeywords`): legacy space-separated `#a #b #c` blobs are split back into individual keywords, over-long or invalid ones are dropped, and an entry left with nothing gets a keyword derived from its body. The read path never writes — `/memory rebuild` is what persists the repair.
 
 ### Injection
 
@@ -154,7 +183,7 @@ project: myrepo — 9 memories, 17 keywords
 ```
 
 - Byte-stable within a session (snapshot), so the prompt prefix cache stays warm; re-rendered after compaction.
-- **Rendered from the category files at injection time, not read from `MEMORY.md`.** The two always contain the same keyword lines (the file is generated from the same entries), but rendering live means a stale, deleted or hand-damaged `MEMORY.md` can never affect what the model sees.
+- **Rendered from the category files at injection time, not read from `MEMORY.md`.** Both are produced by the same builder from the same entries (`MEMORY.md` writes all 200 keywords, the injected block trims the same table to the budget), but rendering live means a stale, deleted or hand-damaged `MEMORY.md` can never affect what the model sees.
 - Nothing is injected when nothing is stored.
 - Truncation is explicit and staged: counted lines first, then the remaining keywords packed without counts, and only then `(+N more — memory_search mode:"keyword")`.
 
