@@ -4,3 +4,6 @@ node_modules/
 .DS_Store
 docs/
 .npmrc
+
+# pi-memory-auto sidecars: machine-local ranking data, never shared
+.pi/agent/memory-auto/usage.json

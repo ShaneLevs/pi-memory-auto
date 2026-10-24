@@ -34,6 +34,8 @@
     "src",
     "scripts",
     "README.md",
+    "README.zh-CN.md",
+    "TECHNICAL.md",
     "LICENSE"
   ],
   "scripts": {
