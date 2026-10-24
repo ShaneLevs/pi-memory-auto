@@ -4,3 +4,6 @@ pi-memory-auto is installed into the local pi as a LOCAL PATH package (`pi insta
 <!-- mid: 20261024-4b14 | t: 2026-10-24 00:17:50 | p: pi-memory-auto | src: auto | tags: readme-changelog,版本小节,versioning -->
 pi-memory-auto 的 README changelog 只保留最近两个版本小节——发布 0.7.1 时只留 `### 0.7.1` 与 `### 0.7.0`，`0.6.0` 及更早已被删除；新增小节时要顺手删掉最旧的一节。改 `package.json` 版本号与写 changelog 都只是文件编辑，绝不能据此 commit/publish。
 
+<!-- mid: 20261024-9fd4 | t: 2026-10-24 15:36:22 | p: pi-memory-auto | src: auto | tags: documentation,readme,i18n -->
+Keep `README.md` and `README.zh-CN.md` beginner-friendly and free of implementation detail, keep their structure aligned, and place technical information in `TECHNICAL.md`; ship all three documents in the npm package.
+
