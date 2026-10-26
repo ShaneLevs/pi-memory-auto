@@ -1,6 +1,6 @@
 {
   "name": "@shanelevs/pi-memory-auto",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "🧠 Memory extension for the pi coding agent — memories stored as body + 1-3 keywords, a unique keyword table injected into every session, keyword lookup the agent drives itself, duplicate-merging consolidation every N memories. Zero heavy deps.",
   "type": "module",
   "main": "index.ts",

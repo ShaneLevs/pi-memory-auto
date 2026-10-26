@@ -85,3 +85,24 @@ test("near-duplicate pairs are listed with an actionable command", () => {
 	assert.match(text, /\[20261001-aaaa\] ↔ \[20261002-bbbb\]/);
 	assert.match(text, /shared: deploy, rsync/);
 });
+
+test("possible superseded requirements are listed with older vs newer", () => {
+	const entries = [
+		mk("20261001-aaaa", ["dev-server"], "The dev server listens on port 3000."),
+		mk("20261002-bbbb", ["dev-server"], "The dev server listens on port 8080."),
+	];
+	const text = buildMemoryReport(entries, base);
+	assert.match(text, /possible superseded requirements \(1\)/);
+	assert.match(text, /differing values: 3000, 8080/);
+	assert.match(text, /older \[20261001-aaaa\]/);
+	assert.match(text, /newer \[20261002-bbbb\]/);
+});
+
+test("a genuinely different fact produces no conflict block", () => {
+	const entries = [
+		mk("20261001-aaaa", ["dev-server"], "The dev server listens on port 3000."),
+		mk("20261002-bbbb", ["proxy"], "The proxy listens on port 8080."),
+	];
+	const text = buildMemoryReport(entries, base);
+	assert.doesNotMatch(text, /possible superseded requirements/);
+});

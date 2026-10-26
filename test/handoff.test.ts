@@ -34,7 +34,8 @@ FILE: LESSONS.md
 LAYER: global
 TAGS: deploy,rsync,backup
 TEXT: Back up the previous release before rsync --delete.`;
-	const written = await runHandoff(deps, "some transcript", {}, registry(response));
+	const { written, ok } = await runHandoff(deps, "some transcript", {}, registry(response));
+	assert.equal(ok, true);
 	assert.equal(written.length, 1);
 	assert.ok(written[0]!.tags.length <= MAX_KEYWORDS, `got ${written[0]!.tags.length} keywords`);
 	assert.deepEqual(written[0]!.tags, ["deploy", "rsync", "backup"]);
@@ -51,7 +52,7 @@ FILE: LESSONS.md
 LAYER: global
 TAGS: deploy
 TEXT: Back up before rsync --delete.`;
-	const written = await runHandoff(deps, "transcript", {}, registry(response));
+	const { written } = await runHandoff(deps, "transcript", {}, registry(response));
 	assert.deepEqual(written[0]!.tags, ["deploy", "handoff"]);
 	const after = await loadAllEntries(globalDir, projectRoot);
 	assert.equal(after.length, 1);
@@ -59,5 +60,16 @@ TEXT: Back up before rsync --delete.`;
 
 test("handoff writes nothing for an empty transcript", async () => {
 	const { deps } = await setup();
-	assert.deepEqual(await runHandoff(deps, "   ", {}, registry("===ENTRY=== ...")), []);
+	const { written, ok } = await runHandoff(deps, "   ", {}, registry("===ENTRY=== ..."));
+	assert.deepEqual(written, []);
+	assert.equal(ok, true, "an empty transcript is a real (empty) result, not a failure");
+});
+
+test("a failed handoff call is reported as not ok", async () => {
+	const { deps } = await setup();
+	const outcome = await runHandoff(deps, "transcript", {}, {
+		complete: async () => ({ content: [], stopReason: "error" }),
+	});
+	assert.equal(outcome.ok, false);
+	assert.deepEqual(outcome.written, []);
 });

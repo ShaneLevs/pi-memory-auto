@@ -37,23 +37,31 @@ export interface HandoffDeps {
 	llmMaxTokens: number;
 }
 
-/** Run the handoff extraction. Never throws; returns written entries. */
+/** Outcome of one handoff extraction. `ok: false` means the model never
+ *  answered, so the messages were NOT examined and the caller must not treat
+ *  them as covered. */
+export interface HandoffOutcome {
+	written: MemoryEntry[];
+	ok: boolean;
+}
+
+/** Run the handoff extraction. Never throws. */
 export async function runHandoff(
 	deps: HandoffDeps,
 	transcript: string,
 	model: unknown,
 	registry: unknown,
-): Promise<MemoryEntry[]> {
+): Promise<HandoffOutcome> {
 	const { parseReviewResponse } = await import("./extractor.ts");
 	const written: MemoryEntry[] = [];
-	if (transcript.trim().length === 0) return written;
+	if (transcript.trim().length === 0) return { written, ok: true };
 
 	const result = await completeWithSessionModel(
 		model as Parameters<typeof completeWithSessionModel>[0],
 		registry as Parameters<typeof completeWithSessionModel>[1],
 		{ systemPrompt: HANDOFF_SYSTEM_PROMPT, userPrompt: `<conversation>\n${transcript.slice(-HANDOFF_TRANSCRIPT_MAX_CHARS)}\n</conversation>`, maxTokens: deps.llmMaxTokens },
 	);
-	if (!result.ok) return written;
+	if (!result.ok) return { written, ok: false };
 
 	for (const c of parseReviewResponse(result.text, deps.projectRoot)) {
 		// Merge the handoff marker into the keyword budget instead of appending a
@@ -71,5 +79,5 @@ export async function runHandoff(
 		});
 		if (!outcome.deduped) written.push(outcome.entry);
 	}
-	return written;
+	return { written, ok: true };
 }

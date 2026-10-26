@@ -65,6 +65,17 @@ Why not tear it out? Because the old sentence often contains a detail the new
 one forgot — and tearing out is permanent. If that judgement is ever wrong, the
 detail is gone for good.
 
+The hard case is when the change happens and nobody writes it down: you say
+"stop using MySQL, use PostgreSQL" in a session where nothing gets extracted,
+and months later the only thing on the page is still "use MySQL". So the plugin
+makes three separate attempts to catch it. It tells the model that a memory is
+a record of what was true *when it was written*, with the newest instruction
+outranking it, and asks it to retire the outdated entry in the same turn. When
+memories are reviewed it pairs up entries that share a keyword but disagree
+(port 3000 vs 8080, rsync vs GitHub Actions) and shows them to the model as
+"possible conflicts". And the next tidying round retires the older half of such
+a pair even if no turn ever noticed the change.
+
 **3. Something has not been checked for a long time → stick "please re-check" on it.**
 
 Tools and habits change within months, so "this library has no X" can become
@@ -78,14 +89,16 @@ useful?" would require guessing, and guessing wrong loses data.
 ## Tidying up
 
 Every 20 new memories (or on request) it does a round of tidying: two entries
-about the same thing become one, and different spellings of one concept become a
-single keyword. It tells you how many were merged, and every file it rewrites
-keeps a backup.
+about the same thing become one, different spellings of one concept become a
+single keyword, and when two entries are two versions of one fact the older one
+is retired. It tells you how many were merged, and every file it rewrites keeps
+a backup.
 
 `/memory` gives you a checkup at any time: which entries have been replaced,
 which keywords nobody ever searched for, which ones are due for a re-check, and
-which pairs look like duplicates. Every suggestion there is manual — nothing is
-applied behind your back.
+which pairs look like duplicates **or like two versions of one fact nobody
+retired**. Every suggestion there is manual — nothing is applied behind your
+back.
 
 ## It gets better at guessing what you need
 
@@ -142,6 +155,12 @@ Optional, environment variables, all with sensible defaults:
 | `PI_MEMORY_AUTO_REVIEW_MONTHS` | `0` | Re-check interval in months, `0` = 3/6/12 by topic |
 
 ## What's new
+
+**0.9.0** — two fixes. Long sessions no longer pile up duplicate memories: a
+turn is reviewed at most once, and each review only looks at what is new since
+the last one. And a requirement you changed but never re-saved no longer goes
+unnoticed — memories that contradict each other are detected, shown to the
+model, and the outdated one is retired instead of being followed.
 
 **0.8.0** — the notebook learned to correct itself: repeating a memory puts a
 tick on the old one instead of adding a copy, a wrong memory gets "see the new

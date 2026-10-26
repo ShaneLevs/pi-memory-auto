@@ -8,6 +8,7 @@
  */
 
 import { collectKeywords, type IndexInput, type UsageMap } from "./index-map.ts";
+import { describeConflict, findConflictCandidates } from "./conflicts.ts";
 import { describeCandidate, findDuplicateCandidates, type DuplicateCandidate } from "./duplicates.ts";
 import { summarizeStaleness, type StalenessSummary } from "./staleness.ts";
 import type { Layer } from "./types.ts";
@@ -31,6 +32,8 @@ export interface ReportOptions {
 	width?: number;
 	/** Max near-duplicate pairs listed per layer (default 5). */
 	maxCandidates?: number;
+	/** Max likely-superseded pairs listed per layer (default 3). */
+	maxConflicts?: number;
 	/** Keyword recall counts from memory_search (usage.ts). */
 	usage?: { global?: UsageMap; project?: UsageMap };
 	/** Staleness override in months (0 = per-file defaults, see staleness.ts). */
@@ -74,11 +77,13 @@ function layerBlock(
 	const items = table.rows.map((row) => `#${row.display}${row.count > 1 ? ` (${row.count})` : ""}`);
 	const file = layer === "global" ? `${opts.globalDir}/MEMORY.md` : `${opts.projectRoot}/.pi/agent/memory-auto/MEMORY.md`;
 	const candidates = candidateBlock(layer, entries, opts);
+	const conflicts = conflictBlock(layer, entries, opts);
 	return [
 		header,
 		wrapKeywords(items, opts.width ?? 88),
 		...(health ? [health] : []),
 		...(candidates ? [candidates] : []),
+		...(conflicts ? [conflicts] : []),
 		`  file: ${file}${table.dropped > 0 ? ` · ${table.dropped} over the 200-keyword cap` : ""}`,
 	].join("\n");
 }
@@ -129,6 +134,30 @@ function candidateBlock(layer: Layer, entries: IndexInput[], opts: ReportOptions
 	const lines = [`  merge candidates (${found.length}) — /memory compact ${cmd}:`];
 	for (const candidate of found) {
 		for (const line of describeCandidate(candidate, 60).split("\n")) lines.push(`    ${line}`);
+	}
+	return lines.join("\n");
+}
+
+/**
+ * Pairs that look like two VERSIONS OF ONE FACT, newer one second.
+ *
+ * These are the memories behind the "I changed the requirement and the old one
+ * kept being read" failure: a merge will not touch them (they are not
+ * duplicates — see conflicts.ts), so they need either a supersede or a human
+ * verdict. Both are shown, newest last, because judging the pair requires
+ * seeing what changed.
+ */
+function conflictBlock(layer: Layer, entries: IndexInput[], opts: ReportOptions): string {
+	const scoped = entries.filter(({ entry }) => entry.layer === layer);
+	if (scoped.length < 2) return "";
+	const found = findConflictCandidates(scoped, { limitPerLayer: opts.maxConflicts ?? 3 });
+	if (found.length === 0) return "";
+	const cmd = layer === "global" ? "user" : "project";
+	const lines = [
+		`  possible superseded requirements (${found.length}) — older vs newer; if the newer one is current, write it again with supersedes:[older id], or /memory compact ${cmd} to let the pass decide:`,
+	];
+	for (const candidate of found) {
+		for (const line of describeConflict(candidate, 60).split("\n")) lines.push(`    ${line}`);
 	}
 	return lines.join("\n");
 }

@@ -19,6 +19,7 @@
  */
 
 import { GLOBAL_CATEGORY_FILES, PROJECT_CATEGORY_FILES, LLM_TIMEOUT_MS } from "./constants.ts";
+import { buildConflictHintBlock, findConflictCandidates, type ConflictCandidate } from "./conflicts.ts";
 import { describeCandidate, findDuplicateCandidates, type DuplicateCandidate } from "./duplicates.ts";
 import { sanitizeKeywords } from "./keywords.ts";
 import { completeWithSessionModel } from "./llm.ts";
@@ -37,12 +38,15 @@ const MAX_MERGES = 40;
 const MAX_RENAMES = 40;
 /** Max near-duplicate pairs attached to one prompt as a hint. */
 const MAX_HINTS = 6;
+/** Max conflict pairs attached to one prompt as a hint. */
+const MAX_CONFLICT_HINTS = 4;
 
 export const CONSOLIDATION_SYSTEM_PROMPT = `You consolidate a coding agent's long-term memory store.
 
 You are given the stored memories (id, keywords, text). Find ONLY:
 1. genuine duplicates or near-duplicates that say the same thing and should become ONE memory — same fact stated twice, one entry superseded by another, or two entries about the same decision/lesson;
-2. keywords that are the same concept spelled differently and should be merged.
+2. keywords that are the same concept spelled differently and should be merged;
+3. a SUPERSEDED requirement: two memories about the SAME subject that disagree, where an older one states a value, command, path, port, version, library or convention that a newer one replaces (e.g. rsync → GitHub Actions, npm → pnpm, port 3000 → 8080). The newer one is the current truth; the older one is obsolete and must not stay live.
 
 Do NOT merge memories that are merely related. Different facts, different files, different subsystems, or a general rule plus a specific instance stay separate. When in doubt, do not merge.
 
@@ -62,6 +66,7 @@ Rules:
 - Use ids exactly as given; never invent one.
 - Only merge memories from the same layer (global with global, project with project).
 - A <likely-duplicates> section may be attached: those pairs were flagged by a deterministic similarity check and may reference ids that are NOT in the page above. They are hints, not verdicts — judge them like any other pair.
+- A <possible-conflicts> section may be attached: those pairs look like two VERSIONS OF ONE FACT rather than two separate memories. For such a pair the newer id is KEEP and the older id is DROP (case 3 above). Judge each pair; if the two really are different facts, leave them alone.
 - A kept memory must end up with 1-3 keywords. A keyword is at most 8 Chinese characters or 8 english words.
 - Prefer the more complete version of the text when you merge; keep concrete details (paths, commands, versions) and drop repetition.
 - If there is nothing to merge, respond with exactly: NOTHING_TO_MERGE`;
@@ -95,6 +100,7 @@ export function buildConsolidationPrompt(
 	entries: { entry: MemoryEntry; file: string }[],
 	limit = MAX_ENTRIES_IN_PROMPT,
 	hints: DuplicateCandidate[] = [],
+	conflictHints: ConflictCandidate[] = [],
 ): string {
 	const sorted = [...entries].sort((a, b) => (a.entry.time < b.entry.time ? 1 : -1));
 	const shown = sorted.slice(0, limit);
@@ -107,7 +113,9 @@ export function buildConsolidationPrompt(
 		hints.length > 0
 			? `\n\n<likely-duplicates>\n${hints.slice(0, MAX_HINTS).map((h) => `- ${describeCandidate(h, 50)}`).join("\n")}\n</likely-duplicates>`
 			: "";
-	return `<memories>\n${lines.join("\n\n")}\n</memories>${note}${hintBlock}\n\nRespond with merge/rename blocks, or NOTHING_TO_MERGE.`;
+	const conflictBlock = buildConflictHintBlock(conflictHints.slice(0, MAX_CONFLICT_HINTS));
+	const conflictSection = conflictBlock ? `\n\n${conflictBlock}` : "";
+	return `<memories>\n${lines.join("\n\n")}\n</memories>${note}${hintBlock}${conflictSection}\n\nRespond with merge/rename blocks, or NOTHING_TO_MERGE.`;
 }
 
 /**
@@ -232,13 +240,17 @@ export async function runConsolidation(
 		// Hints span the whole pool (not just this page): the pairs most worth
 		// merging are exactly the ones that time-ordered paging would separate.
 		const hints = findDuplicateCandidates(pool, { limit: MAX_HINTS });
+		// A requirement that was changed in one session and never superseded leaves
+		// two live, disagreeing memories. Paging cannot catch that either, so the
+		// deterministic conflict pairs are named here as well (case 3 of the prompt).
+		const conflicts = findConflictCandidates(pool, { limitPerLayer: MAX_CONFLICT_HINTS });
 
 		const response = await completeWithSessionModel(
 			model as Parameters<typeof completeWithSessionModel>[0],
 			registry as Parameters<typeof completeWithSessionModel>[1],
 			{
 				systemPrompt: CONSOLIDATION_SYSTEM_PROMPT,
-				userPrompt: buildConsolidationPrompt(page, MAX_ENTRIES_IN_PROMPT, hints),
+				userPrompt: buildConsolidationPrompt(page, MAX_ENTRIES_IN_PROMPT, hints, conflicts),
 				maxTokens: deps.llmMaxTokens,
 				...(timeoutMs !== undefined ? { timeoutMs } : {}),
 			},
@@ -253,12 +265,10 @@ export async function runConsolidation(
 		const byId = new Map(page.map(({ entry }) => [entry.id, entry]));
 		// Let a hinted pair name an id that is not on this page, otherwise the hint
 		// could never be acted on (parse drops unknown ids).
-		for (const hint of hints) {
-			for (const side of [hint.a, hint.b]) {
-				if (byId.has(side.id)) continue;
-				const source = pool.find(({ entry }) => entry.id === side.id);
-				if (source) byId.set(side.id, source.entry);
-			}
+		for (const hint of [...hints.map((h) => [h.a, h.b]), ...conflicts.map((c) => [c.older, c.newer])].flat()) {
+			if (byId.has(hint.id)) continue;
+			const source = pool.find(({ entry }) => entry.id === hint.id);
+			if (source) byId.set(hint.id, source.entry);
 		}
 		const plan = parseConsolidationPlan(response.text, byId);
 		if (plan.merges.length === 0 && plan.keywordRenames.length === 0) continue;

@@ -19,8 +19,11 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Type } from "typebox";
 import { loadConfig } from "./src/config.ts";
 import { CONSOLIDATION_TIMEOUT_MS, runConsolidation } from "./src/consolidate.ts";
-import { CLASSIFICATION_RUBRIC, EXISTING_MEMORIES_MAX_CHARS, INJECTION_PREAMBLE, LLM_TIMEOUT_MS, MAIN_FILE, WRITABLE_FILES } from "./src/constants.ts";
+import { CLASSIFICATION_RUBRIC, INJECTION_PREAMBLE, LLM_TIMEOUT_MS, MAIN_FILE, WRITABLE_FILES } from "./src/constants.ts";
+import { buildExistingMemoriesDigest } from "./src/digest.ts";
+import { buildConflictHintBlock, findConflictCandidates } from "./src/conflicts.ts";
 import { isTrivialSession, MAX_SUPERSEDES, runReview, serializeTranscript } from "./src/extractor.ts";
+import { decideReview, emptyReviewCursor, newMessages, recordAttempt, recordReview, type ReviewCursor } from "./src/review-gate.ts";
 import { runHandoff } from "./src/handoff.ts";
 import { materializeAll, type LayerStats } from "./src/indexer.ts";
 import { findTruncationSignal } from "./src/integrity.ts";
@@ -44,6 +47,9 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 	let projectName = path.basename(projectRoot);
 	let reviewInFlight = false;
 	let consolidationInFlight = false;
+	/** Per-session review state: last turn fired for, and how much of the branch
+	 *  a previous review already covered (see review-gate.ts). */
+	let reviewCursor: ReviewCursor = emptyReviewCursor();
 	/** Highest `sinceLast` already sent to consolidation, per layer (avoids
 	 *  re-running on every rebuild when the LLM finds nothing to merge). */
 	const attemptedAt: Record<Layer, number> = { global: -1, project: -1 };
@@ -115,42 +121,93 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 			});
 	}
 
-	/** Build the existing-memories digest (recent entries, for review dedup). */
-	async function existingMemoriesDigest(): Promise<string> {
-		const all = await loadAllEntries(config.globalDir, projectRoot);
-		const lines: string[] = [];
-		let total = 0;
-		const sorted = all.sort((a, b) => (a.entry.time < b.entry.time ? 1 : -1));
-		for (const { entry, file } of sorted) {
-			const text = entry.text.trim();
-			if (!text) continue;
-			// The id is what lets the review name a memory in SUPERSEDES. Superseded
-			// entries are listed too — otherwise the model re-writes a fact that was
-			// already corrected.
-			const tags = entry.tags.length > 0 ? ` #${entry.tags.join(" #")}` : "";
-			const dead = entry.supersededBy ? ` (superseded by ${entry.supersededBy})` : "";
-			const line = `- [${entry.id}] [${file}]${tags}${dead} ${text}`;
-			if (total + line.length > EXISTING_MEMORIES_MAX_CHARS) break;
-			lines.push(line);
-			total += line.length;
-		}
-		return lines.join("\n");
+	/** Message payloads currently in the branch, in order (cursor indices refer to this array). */
+	function branchMessages(ctx: ExtensionContext): unknown[] {
+		return branchEntries(ctx)
+			.filter((e) => (e as { type?: string }).type === "message")
+			.map((e) => (e as { message?: unknown }).message);
 	}
 
-	/** Run one background extraction review. Fire-and-forget unless awaited. */
-	function scheduleReview(ctx: ExtensionContext, timeoutMs?: number): Promise<void> {
+	/** Raw session entries on the leaf path (messages, compaction, custom). */
+	function branchEntries(ctx: ExtensionContext): unknown[] {
+		return ctx.sessionManager.getBranch();
+	}
+
+	/**
+	 * How many branch MESSAGES come before `entryId`.
+	 *
+	 * A compaction handoff only sees `messagesToSummarize` — the span before
+	 * `firstKeptEntryId`. Marking the whole branch as covered would skip the kept
+	 * tail, which the handoff never looked at.
+	 */
+	function messagesBefore(ctx: ExtensionContext, entryId: string | null | undefined): number {
+		if (!entryId) return branchMessages(ctx).length;
+		const entries = branchEntries(ctx);
+		const index = entries.findIndex((e) => (e as { id?: string }).id === entryId);
+		if (index < 0) return branchMessages(ctx).length;
+		let count = 0;
+		for (const entry of entries.slice(0, index)) if ((entry as { type?: string }).type === "message") count++;
+		return count;
+	}
+
+	/**
+	 * Build the existing-memories digest for a transcript.
+	 *
+	 * Relevance-ranked over the WHOLE store rather than newest-40-entries: the row
+	 * that needs superseding is often the oldest one, and a time-ordered cut hid
+	 * exactly that row. See digest.ts.
+	 *
+	 * The same loaded store also yields the deterministic conflict hints, so the
+	 * review prompt gets both the entries and the "these look like two versions of
+	 * one fact" pairs from a single disk pass.
+	 */
+	async function reviewContext(transcript: string): Promise<{ existingMemories: string; conflictHints: string }> {
+		const all = await loadAllEntries(config.globalDir, projectRoot);
+		return {
+			existingMemories: buildExistingMemoriesDigest(all, transcript),
+			conflictHints: buildConflictHintBlock(findConflictCandidates(all)),
+		};
+	}
+
+	/**
+	 * Run one background extraction review. Fire-and-forget unless awaited.
+	 *
+	 * `messages` is normally only the tail that arrived since the previous review.
+	 * The caller has already recorded the turn as attempted; this function advances
+	 * the message cursor only when the extraction actually succeeded, so a failed
+	 * call (provider error, timeout) leaves that tail uncovered for the next round
+	 * instead of silently dropping it.
+	 */
+	function scheduleReview(
+		ctx: ExtensionContext,
+		opts: { timeoutMs?: number; messages?: unknown[]; covered?: number } = {},
+	): Promise<void> {
 		if (reviewInFlight) return Promise.resolve();
 		const { model, registry } = modelInfo(ctx);
 		if (!model || !registry) return Promise.resolve();
-		const branch = ctx.sessionManager.getBranch().filter((e) => (e as { type?: string }).type === "message").map((e) => (e as { message?: unknown }).message);
+		const branch = branchMessages(ctx);
+		const fresh = opts.messages ?? branch;
+		// How many messages this call would cover. Recorded on success only.
+		const covered = opts.covered ?? branch.length;
+		// Triviality is a property of the SESSION, not of the slice: an incremental
+		// review covers only the turns since the previous one, which is a handful of
+		// messages even in a long session. Testing the slice here would silently
+		// drop that tail (the cursor has already moved past it).
 		if (isTrivialSession(branch.length)) return Promise.resolve();
-		const transcript = serializeTranscript(branch);
+		const transcript = serializeTranscript(fresh);
 		if (transcript.trim().length === 0) return Promise.resolve();
 
 		reviewInFlight = true;
-		return existingMemoriesDigest()
-			.then((existingMemories) => runReview(writeDeps(), transcript, model, registry, timeoutMs, existingMemories))
-			.then(async (written) => {
+		return reviewContext(transcript)
+			.then(async ({ existingMemories, conflictHints }) => {
+				const outcome = await runReview(writeDeps(), transcript, model, registry, opts.timeoutMs, existingMemories, conflictHints);
+				// Only a call that actually reached the provider covers the messages. A
+				// failed call (error, timeout, empty response) leaves the tail for the next
+				// round: dropping it here is how a provider hiccup silently lost a whole
+				// conversation, and re-offering it costs one extra call.
+				if (!outcome.ok) return;
+				reviewCursor = recordReview(reviewCursor, covered);
+				const { written } = outcome;
 				if (written.length === 0) return;
 				await refreshIndexes(ctx);
 				if (ctx.hasUI) ctx.ui.notify(`memory-auto: saved ${written.length} memory entries`, "info");
@@ -471,6 +528,9 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 		projectRoot = ctx.cwd;
 		projectName = path.basename(projectRoot);
 		snapshots.reset();
+		// A new session starts with a fresh cadence gate: the branch may already be
+		// long (resume/fork), and nothing has been reviewed in it yet.
+		reviewCursor = emptyReviewCursor();
 		// Keep the derived MEMORY.md keyword tables in sync (creates them the
 		// first time) and catch up on a consolidation that was due before exit.
 		void refreshIndexes(ctx);
@@ -497,10 +557,25 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 
 	pi.on("turn_end", async (_event, ctx) => {
 		ctxRef = ctx;
-		// Stateless trigger: count total turns from the branch each turn;
-		// extract at every multiple of reviewTurns (e.g. 8 → turns 8, 16, 24...).
-		if (countTurns(ctx) % config.reviewTurns !== 0 || reviewInFlight) return;
-		scheduleReview(ctx);
+		// Stateless trigger: count total turns from the branch each turn; fire at
+		// every multiple of reviewTurns (e.g. 8 → turns 8, 16, 24...).
+		//
+		// The DECISION is stateful (review-gate.ts): `turn_end` is delivered more
+		// than once for the same turn during a long tool loop, and re-firing on the
+		// same turn re-extracts the same conversation into differently-worded
+		// "new" memories. A turn index is reviewed at most once per session, and
+		// only the messages added since the previous review are sent.
+		const turn = countTurns(ctx);
+		const decision = decideReview(reviewCursor, turn, config.reviewTurns);
+		if (!decision.fire || reviewInFlight) return undefined;
+		const branch = branchMessages(ctx);
+		const fresh = newMessages(branch, reviewCursor);
+		// Record the ATTEMPT before the async work starts, so a duplicate dispatch a
+		// moment later cannot slip past the in-flight flag. The message cursor is
+		// advanced separately, only after the extraction actually succeeded.
+		reviewCursor = recordAttempt(reviewCursor, turn);
+		if (fresh.length === 0) return undefined;
+		scheduleReview(ctx, { messages: fresh, covered: branch.length });
 		return undefined;
 	});
 
@@ -513,10 +588,24 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 			// CHARACTERS (HANDOFF_TRANSCRIPT_MAX_CHARS, keeping the tail). Slicing the
 			// message array by that number instead would keep N messages, which has
 			// nothing to do with the budget.
-			const transcript = serializeTranscript([...event.preparation.messagesToSummarize]);
+			const summarized = [...event.preparation.messagesToSummarize];
+			// The handoff reads the same messages a review would: whatever it covers
+			// must not be re-sent by the next periodic review, or the pre-compaction
+			// turns get extracted twice (once as handoff, once as review).
+			//
+			// The cursor moves only when the handoff SUCCEEDED, and only past the span the
+			// handoff actually saw. getBranch() keeps the whole leaf path (compaction does
+			// not prune it), so a failed handoff leaves those messages available to the
+			// next review instead of dropping them.
+			const coveredUpTo = messagesBefore(ctx, event.preparation.firstKeptEntryId);
+			const transcript = serializeTranscript(summarized);
 			void runHandoff(writeDeps(), transcript, model, registry)
-				.then(async (written) => {
-					if (written.length > 0) await syncIndexesNow(ctx);
+				.then(async (outcome) => {
+					// Same rule as the periodic review: only a call the provider actually
+					// answered covers the messages it was given.
+					if (!outcome.ok) return;
+					reviewCursor = recordReview(reviewCursor, coveredUpTo);
+					if (outcome.written.length > 0) await syncIndexesNow(ctx);
 				})
 				.catch(() => undefined);
 		}
@@ -533,8 +622,14 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 	pi.on("session_shutdown", async (event, ctx) => {
 		if (event.reason !== "quit") return;
 		try {
+			// The flush covers whatever the last periodic review did not. It bypasses
+			// the cadence gate on purpose (the session ends here) but still honours the
+			// cursor: re-sending the whole branch here would extract the entire
+			// conversation one more time, which is how quitting produced duplicate rows.
+			// Nothing new since the last review → nothing to flush.
+			const fresh = newMessages(branchMessages(ctx), reviewCursor);
 			await Promise.race([
-				scheduleReview(ctx, SHUTDOWN_FLUSH_TIMEOUT_MS),
+				scheduleReview(ctx, { timeoutMs: SHUTDOWN_FLUSH_TIMEOUT_MS, messages: fresh }),
 				new Promise<void>((resolve) => {
 					// Deliberately NOT unref'd: this timer is the guarantee that the
 					// await above terminates even if the provider never answers.

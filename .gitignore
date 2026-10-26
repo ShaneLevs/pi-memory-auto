@@ -5,5 +5,4 @@ node_modules/
 docs/
 .npmrc
 
-# pi-memory-auto sidecars: machine-local ranking data, never shared
-.pi/agent/memory-auto/usage.json
+.pi/

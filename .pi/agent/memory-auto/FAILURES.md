@@ -10,3 +10,6 @@ Before selecting a release version, compare `package.json`, Git tags, and npm’
 <!-- mid: 20261024-5678 | t: 2026-10-24 15:47:05 | p: pi-memory-auto | src: auto | tags: npm,node,jiti -->
 When validating the published npm package, do not import its TypeScript source with Node’s `--experimental-strip-types` because Node refuses type stripping under `node_modules`; compare the installed tarball with the repo or run it through pi’s jiti loader.
 
+<!-- mid: 20261024-628b | t: 2026-10-24 15:54:15 | p: pi-memory-auto | src: user | tags: npm发布,版本号,git-tag -->
+pi-memory-auto 发布新版本前必须同时核对三处：`package.json` 的 version、git tag 列表、npm 上已发布的 versions——它们会不一致。实际情况：v0.7.0/v0.7.1 只打了 git tag、从未发到 npm（npm latest 停在 0.6.0），所以 0.8.0 发布时 npm 版本从 0.6.0 直接跳到 0.8.0，中间 0.7.x 在 npm 上不存在。看到 git tag 有某个版本不代表 npm 上有。
+

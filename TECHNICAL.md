@@ -18,6 +18,7 @@ in the [README](README.md).
 - [Staleness](#staleness)
 - [Usage log](#usage-log)
 - [Near-duplicate detection](#near-duplicate-detection)
+- [Superseded requirements](#superseded-requirements)
 - [Consolidation](#consolidation)
 - [Retrieval](#retrieval)
 - [Commands](#commands)
@@ -55,6 +56,10 @@ Four rules that every module obeys; most of the design follows from them.
    path that removes a row is consolidation, and only when the model proposed
    the merge *and* the plan validated against entries that actually exist. The
    only other deletion is a layer's `MEMORY.md` when its last entry is gone.
+   A changed requirement is therefore handled by **retiring** the old row
+   (`superseded-by`), never by dropping it — an automated system that can delete
+   has no way to undo a wrong deletion, and the entry is the only record of what
+   used to be true.
 2. **The model proposes, the code decides.** Extraction output, consolidation
    plans and keywords are all re-validated locally. A failed or malformed LLM
    response changes nothing.
@@ -73,21 +78,40 @@ Five hooks, in the order a session hits them. None of them can fail the run.
 |---|---|---|
 | `session_start` | Rewrite both `MEMORY.md` tables from the entries, then `maybeConsolidate` — which catches up a round that was due before the last exit | no, the session starts immediately |
 | `before_agent_start` | Re-render the keyword table **only** on the first run and right after compaction; every other run returns nothing, so the prompt bytes stay identical and the prefix cache survives | yes (it builds the prompt) |
-| `turn_end` | Every `REVIEW_TURNS` turns: serialize the conversation, review it, append at most 3 entries, rebuild the index | no, it lands on a later turn |
+| `turn_end` | Every `REVIEW_TURNS` turns: serialize the messages added since the last review, review them, append at most 3 entries, rebuild the index. A turn index is reviewed at most once, so repeated `turn_end` delivery cannot re-extract | no, it lands on a later turn |
 | `session_before_compact` | One handoff extraction over the messages being summarized (at most 2 entries), then mark the index for re-render | no, compaction is never delayed |
 | `session_shutdown` | Only for `quit` (never reload/new/resume/fork): one last review of the conversation tail, hard-capped at 30 s and awaited — pi tears the process down right after the handler returns | yes, raced against a timeout |
 
 Turn counting is stateless: the turn number is derived from the session branch
 on every `turn_end`, so restarts, compaction and forks cannot desynchronise a
-counter. A session with fewer than 4 messages is never reviewed.
+counter. The *decision* to review is stateful (`src/review-gate.ts`), and its
+two pieces of state move at different moments on purpose:
+
+- `lastTurn` is recorded **before** the async call. A repeated `turn_end` for
+the same turn index can therefore never start a second review, even after the
+first one has finished.
+- the message `cursor` is recorded **after** the call succeeded. If the provider
+errors, times out or returns an empty/aborted response, nothing is marked as
+covered and the next round re-offers the same tail. Both `runReview` and
+`runHandoff` report this as `ok: false`, so "the model never answered" is never
+confused with "the conversation held nothing worth storing".
+
+A session with fewer than 4 messages is never reviewed. Triviality is tested
+against the whole branch, not against the slice being sent: an incremental
+review covers only the turns since the previous one, which is a handful of
+messages even in a long session.
 
 Extraction is skipped entirely when: the session is trivial, no session model
-is available, a review is already in flight, or the serialized transcript is
-empty. The transcript is capped at 60 000 characters **keeping the tail**, and
-runs through pi's own `serializeConversation` (the compaction path), so the
-model sees `[Assistant tool calls]` / `[Tool result]` lines and not only prose.
-The review prompt also carries an "Existing memories" digest, capped at 4 000
-characters, with entry ids — that is what makes dedup and `SUPERSEDES:` possible.
+is available, a review is already in flight, the turn was already reviewed (`turn_end`
+is delivered more than once per turn during a long tool loop), there is nothing
+new after the cursor, or the serialized transcript is empty. Only the messages
+after the cursor are sent, and the transcript is capped at 60 000 characters
+**keeping the tail**; it runs through pi's own `serializeConversation` (the
+compaction path), so the model sees `[Assistant tool calls]` / `[Tool result]`
+lines and not only prose. The review prompt also carries an "Existing memories"
+digest (capped at 4 000 characters, all ids that fit are listed) and any
+`<possible-conflicts>` pairs — that is what makes dedup, `SUPERSEDES:` and
+retiring an outdated requirement possible.
 
 ## What happens to a memory
 
@@ -97,6 +121,7 @@ Every mechanism acts on one of these rows:
 |---|---|---|---|---|
 | Written again, identical body | `seen`/`last` bumped in place | unchanged | unchanged | one row |
 | Written again, different wording | nothing — it becomes a near-duplicate candidate | both keywords listed | both rows returned | two rows, until a merge |
+| Written again about the same subject with a changed value | conflict candidate → the model judges it, then `supersedes` | only the new row's keywords stay | old row ranks last, labelled | two rows, old one marked |
 | Corrected | `supersedes` → old row gains `superseded-by` | old row's keywords leave | old row ranks last, labelled | old row kept |
 | Not verified for its interval | derived from `last`/`time`, nothing stored | unchanged | ranks below fresh, labelled `stale` | kept |
 | Merged by consolidation | drop rows, keep one, rewrite the file (`.bak` kept) | recomputed | one result | row removed |
@@ -322,6 +347,61 @@ Superseded rows are skipped, layers are compared separately, and the output is
 deterministic (including order). A false candidate costs one line in a report; a
 false merge loses a memory, so the bias is towards silence.
 
+## Superseded requirements
+
+The failure this layer exists for: a memory records a requirement, the user
+changes that requirement in a later session, and the change is never written
+down. Both memories stay live, and a later session reads whichever the index
+ranks first — so it confidently follows the instruction the user already
+abandoned. Nothing about that is a missing *delete*: the store is missing a
+**conflict**, and deleting cannot detect one either.
+
+Three places close it, in increasing order of intelligence:
+
+1. **Write time.** The extraction prompt carries the live memories as a digest,
+   including entry ids, and instructs the model to emit `SUPERSEDES: <id>` when
+the user's newer instruction replaces one of them. `memory_write` accepts the
+   same thing directly, and the injected contract states that the user's current
+   instruction outranks any stored memory that covers the same thing.
+2. **Deterministic detection** (`src/conflicts.ts`). Pairs of live entries in the
+   same layer that *share a keyword* and whose bodies are similar enough to be
+   about one subject, but whose content diverged, are conflict candidates. A
+   diverged number is the strongest signal (port, version, timeout); rows that
+   only look templated but share no keyword are ignored, and identical bodies
+   are left to the duplicate layer. Like `duplicates.ts`, this module never
+   decides anything — it only produces pairs, and it is attached as a
+   `<possible-conflicts>` hint when the store is reviewed.
+3. **Consolidation.** The `<possible-conflicts>` hint is passed to the rounds, and
+   the prompt gained case 3: the newer memory is KEEP, the older one is DROP
+   (i.e. superseded), and a pair that turns out to be two genuinely different
+   facts is left alone. So a stale requirement is retired the next time the
+   store is compacted, even if no turn ever noticed the change.
+
+A `<possible-conflicts>` line reads:
+
+```
+- shared: dev-server | differing values: 3000, 8080
+  older [20261001-aaaa] The dev server listens on port 3000.
+  newer [20261002-bbbb] The dev server listens on port 8080.
+```
+
+The older id is the one superseded. Ranking inside a layer prefers pairs with
+diverging numbers, then higher similarity; the output keeps input order so the
+same store always yields the same prompt.
+
+Retiring is deliberately weaker than deleting, and it is reversible by
+re-asserting the old body (which revives the fact as a new live row):
+
+| | Live row | Superseded row |
+|---|---|---|
+| In `MEMORY.md` | its keywords | keywords removed |
+| In `memory_search` | normal rank | ranked last, labelled `superseded by [id]` |
+| On disk | its body | its body, `superseded-by` added |
+
+The injected contract also tells the model what to do when it reads two
+memories that disagree: the newer one wins, and the older one should be
+superseded rather than followed.
+
 ## Consolidation
 
 Triggered when a layer has accumulated `CONSOLIDATE_EVERY` new memories
@@ -339,7 +419,11 @@ sent, and only their files are rewritten.
 2. Each prompt also carries a `<likely-duplicates>` hint: the top deterministic
    near-duplicate pairs computed over the **whole** store, whose ids may sit
    outside the page. They are hints, never verdicts, and they close the paging
-   blind spot below.
+   blind spot below. A second hint block, `<possible-conflicts>`, names pairs
+   that look like two versions of one fact (see
+   [Superseded requirements](#superseded-requirements)); the newer id is kept
+   and the older superseded. Hint ids are resolved against the whole pool, so a
+   pair is actionable even when one side is off-page.
 3. For each page the model receives id / layer / keywords / body and proposes
    `===MERGE===` (keep one, drop duplicates, optional merged text/keywords) and
    `===RENAME===` (keyword synonym) blocks.
@@ -385,7 +469,7 @@ No vector search — the model does the query expansion (synonyms, translations)
 
 | Command | Effect |
 |---|---|
-| `/memory` or `/memory show` | Print both layers' keyword tables, memory/keyword counts, the `sinceLast` watermark, the consolidation marker, the file paths, and the **health line** plus **merge candidates** with the exact command to act on them. The report is added to the transcript as a custom message (so the agent sees the current index too). |
+| `/memory` or `/memory show` | Print both layers' keyword tables, memory/keyword counts, the `sinceLast` watermark, the consolidation marker, the file paths, and the **health line**, **merge candidates** and **possible superseded requirements** with the exact command to act on them. The report is added to the transcript as a custom message (so the agent sees the current index too). |
 | `/memory compact project` | Merge duplicate memories in **this project's layer only**, then reset that layer's watermark. Needs a session model; failure leaves the store untouched. |
 | `/memory compact user` | Same, for the **user (global) layer only**. |
 | `/memory rebuild project` | **Re-derive this project's keywords with the session model**, write them back into the entry metadata (`.bak` kept), then regenerate that layer's `MEMORY.md`. Batched 12 entries per call; without a session model it only repairs malformed tags deterministically. |
@@ -416,12 +500,23 @@ of them is automatic:
   merge candidates (2) — /memory compact project:
     · [20261001-aaaa] ↔ [20261020-bbbb] 78% shared: deploy, rsync
       "Deploy goes through rsync to the staging host." / "Deploy uses rsync to reach staging."
+  possible superseded requirements (1) — older vs newer; if the newer one is current, write it again with supersedes:[older id], or /memory compact project to let the pass decide:
+    - shared: dev-server | differing values: 3000, 8080 | confidence 88%
+      older [20261001-aaaa] (2026-10-01 10:00:00, project/DECISIONS.md): "The dev server listens on port 3000."
+      newer [20261002-bbbb] (2026-10-02 10:00:00, project/DECISIONS.md): "The dev server listens on port 8080."
 ```
 
 A non-zero counter is an instruction, not a warning: superseded rows can be
 merged away by a consolidation round, never-recalled keywords are what
 `/memory rebuild` re-derives, and stale entries are re-confirmed by writing them
 again or replaced with `supersedes`.
+
+The last block lists the pairs `src/conflicts.ts` judged to be two versions of
+one fact. They are deliberately NOT in the merge list: they are not duplicates,
+so a merge would keep whichever body it saw fit and still leave the obsolete
+value reachable. The two rows are printed oldest first with the differing values
+spelled out, because the decision is "which of these two numbers is current" —
+that is the exact decision a reader cannot make from the keyword table.
 
 "Never recalled" is only shown once the layer has accumulated at least 5 recalls
 in total — on a fresh install every keyword sits at zero, which would read as a
@@ -452,6 +547,32 @@ reaches a prompt or a tool description is English; Chinese appears only in desig
 docs.
 
 ## Changelog (detailed)
+
+### 0.9.0
+
+- **A review is no longer re-triggered by the same turn.** The trigger used to be
+  a turn counter plus a bare `reviewInFlight` flag, so `turn_end` firing more
+  than once for one turn index (long tool loops, retries) started another review
+  as soon as the previous one finished — each appending up to three more
+  memories worded just differently enough to miss the exact-body dedup. The
+  decision is now stateful per session (`src/review-gate.ts`): a turn index is
+  reviewed at most once, and `lastTurn` is recorded *before* the async work
+  starts so a duplicate dispatch cannot slip through the gap.
+- **The transcript is incremental.** Each review serializes only the messages
+  after a per-session cursor (`newMessages`) instead of the whole conversation
+  again, so a late review sees new material instead of re-extracting from what
+  earlier reviews already covered. A compaction handoff advances the same cursor,
+  and the quit flush honours it, so the pre-compaction turns are not extracted
+  twice. A cursor past the end (fork, shrunk branch) reads as "nothing new"
+  rather than replaying the entire history. The cursor moves only when the
+  extraction actually succeeded (`ok`), so a provider failure defers the tail to
+  the next round instead of silently dropping it.
+- **Stale requirements are detected and retired.** `src/conflicts.ts` finds live
+  pairs that share a keyword but disagree, the extractor prompt gained
+  `SUPERSEDES:`, consolidation gained case 3 (newer kept, older superseded), and
+  the injected contract now tells the model that a memory is a record of what was
+  true when written, so the user's current instruction wins and the outdated
+  entry should be superseded in the same turn.
 
 ### 0.8.0
 

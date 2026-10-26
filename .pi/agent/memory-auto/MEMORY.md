@@ -1,5 +1,5 @@
 <!-- AUTO-GENERATED — do not edit. This file is owned entirely by the extension: it is rewritten on every memory write, rebuild and consolidation. The source of truth is the category files in this directory; the memory bodies are never inlined here. -->
-<!-- stats: entries=19 keywords=47 sinceLast=13 lastConsolidated=2026-10-23T16:04:24.665Z -->
+<!-- stats: entries=20 keywords=50 sinceLast=14 lastConsolidated=2026-10-23T16:04:24.665Z -->
 #memory-md (4)
 #memory-injection (3)
 #consolidation (2)
@@ -14,11 +14,13 @@
 #compact-rebuild
 #dedup
 #documentation
+#git-tag
 #i18n
 #idempotent-write
 #jiti
 #memory-extraction
 #node
+#npm发布
 #overflow
 #pi-cli
 #pi-framework
@@ -42,6 +44,7 @@
 #分页
 #同步时机
 #层级隔离
+#版本号
 #版本小节
 #程序独占
 #索引同步

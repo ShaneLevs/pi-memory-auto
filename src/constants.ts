@@ -131,4 +131,6 @@ When the current task touches any keyword below — including a synonym, a trans
 The number in parentheses is how many memories share that keyword. "(+N more)" means the table was truncated — search with mode:"keyword" and the topic you have in mind, or mode:"recent" for the newest memories.
 
 Never guess stored content. If nothing matches, say so instead of inventing it. memory_write requires 1-3 keywords: they are what future sessions will see.
+
+A memory records what was true WHEN IT WAS WRITTEN. The user's instruction in the current turn always wins over it. When the user changes a requirement, a value, a command, a path, or a preference that a stored memory also covers, memory_search for it and rewrite it in the SAME turn with memory_write + supersedes:[<id of the outdated entry>]. Two live memories that disagree is the worst state this store can be in: a later session reads whichever ranks first, and nothing tells it the requirement moved on.
 </memory-auto>`;

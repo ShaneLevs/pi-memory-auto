@@ -32,6 +32,19 @@ The "Existing memories" section lists what is already stored, with each entry's 
 dedup and correction: skip a candidate when an equivalent entry exists, and when a candidate CONTRADICTS or
 CORRECTS an existing memory, name that memory's id in SUPERSEDES instead of writing a second, conflicting entry.
 
+The store is append-only: an entry nobody supersedes stays live forever, is injected into every future session,
+and is returned by search. Two live memories that disagree is the worst state this system can be in — a future
+session will read whichever one ranks first and act on an obsolete requirement.
+
+So when the conversation REPLACES something an existing memory claims (a different command, port, path, version,
+library, convention, or preference for the same subject), that is a correction even if the admission guide would
+otherwise call it "no new information": emit an entry for the current statement and put the obsolete memory's id
+in SUPERSEDES. "The requirement changed" is exactly what SUPERSEDES is for.
+
+A <possible-conflicts> section may be attached: those pairs were flagged by a deterministic similarity check as
+looking like two versions of one fact. Judge each one. If the newer statement is the current truth, supersede the
+older one; if they are genuinely different facts, ignore the pair.
+
 Output format — respond with entries, one block per memory, nothing else:
 
 ===ENTRY===
@@ -53,11 +66,12 @@ Rules:
 - Do not store secrets, API keys, or tokens.`;
 
 /** Serialized recent conversation. */
-export function buildReviewUserPrompt(transcript: string, existingMemories: string): string {
+export function buildReviewUserPrompt(transcript: string, existingMemories: string, conflictHints = ""): string {
 	const sections = [
-		"--- Existing memories (for dedup only) ---",
+		"--- Existing memories (for dedup and correction) ---",
 		existingMemories.trim() || "(empty — nothing stored yet)",
 		"",
+		...(conflictHints.trim() ? [conflictHints.trim(), ""] : []),
 		"--- Conversation to review ---",
 		`<conversation>\n${transcript}\n</conversation>`,
 		"",
@@ -144,9 +158,20 @@ export interface ExtractorDeps {
 	llmMaxTokens: number;
 }
 
+/** Outcome of one review: what was written, and whether the provider answered.
+ *  `ok: false` means the call failed, so the transcript was NOT examined — the
+ *  caller must keep it for the next round instead of advancing its cursor. */
+export interface ReviewOutcome {
+	written: MemoryEntry[];
+	ok: boolean;
+}
+
 /**
- * Run one review. Returns the entries that were written (empty when nothing to save).
- * Never throws; background-safe.
+ * Run one review. Never throws; background-safe.
+ *
+ * `written` empty with `ok: true` means "the conversation held nothing worth
+ * storing" — a real result. Empty with `ok: false` means the model never
+ * answered, which is not a result at all.
  */
 export async function runReview(
 	deps: ExtractorDeps,
@@ -155,21 +180,22 @@ export async function runReview(
 	registry: unknown,
 	timeoutMs?: number,
 	existingMemories = "",
-): Promise<MemoryEntry[]> {
+	conflictHints = "",
+): Promise<ReviewOutcome> {
 	const written: MemoryEntry[] = [];
-	if (transcript.trim().length === 0) return written;
+	if (transcript.trim().length === 0) return { written, ok: true };
 
 	const result = await completeWithSessionModel(
 		model as Parameters<typeof completeWithSessionModel>[0],
 		registry as Parameters<typeof completeWithSessionModel>[1],
 		{
 			systemPrompt: REVIEW_SYSTEM_PROMPT,
-			userPrompt: buildReviewUserPrompt(transcript, existingMemories),
+			userPrompt: buildReviewUserPrompt(transcript, existingMemories, conflictHints),
 			maxTokens: deps.llmMaxTokens,
 			...(timeoutMs !== undefined ? { timeoutMs } : {}),
 		},
 	);
-	if (!result.ok) return written;
+	if (!result.ok) return { written, ok: false };
 
 	const candidates = parseReviewResponse(result.text, deps.projectRoot);
 	for (const c of candidates) {
@@ -188,7 +214,7 @@ export async function runReview(
 		// superseded entries, because that changes the index.
 		if (!outcome.deduped || outcome.superseded > 0) written.push(outcome.entry);
 	}
-	return written;
+	return { written, ok: true };
 }
 
 /** Skip trivial sessions: fewer valid messages than MIN_MESSAGES_FOR_REVIEW. */
