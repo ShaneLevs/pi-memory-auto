@@ -11,7 +11,7 @@
  *   writes files;
  * - this module validates every proposal against the entries that actually
  *   exist (unknown ids ignored, merges never span layers, every survivor keeps
- *   1–3 valid keywords) and applies it deterministically via store.ts, keeping
+ *   one valid keyword) and applies it deterministically via store.ts, keeping
  *   a `.bak` of every rewritten file.
  *
  * Failure is safe: if the proposal is unusable nothing is changed, and the
@@ -56,7 +56,7 @@ Output format. Nothing else, no explanations:
 KEEP: <id of the memory to keep>
 DROP: <id>, <id>
 TEXT: <optional merged body — omit to keep the KEEP body unchanged>
-TAGS: <optional 1-3 keywords — omit to keep the existing keywords>
+TAGS: <optional single keyword — omit to keep the existing keyword>
 
 ===RENAME===
 FROM: <existing keyword>
@@ -67,7 +67,7 @@ Rules:
 - Only merge memories from the same layer (global with global, project with project).
 - A <likely-duplicates> section may be attached: those pairs were flagged by a deterministic similarity check and may reference ids that are NOT in the page above. They are hints, not verdicts — judge them like any other pair.
 - A <possible-conflicts> section may be attached: those pairs look like two VERSIONS OF ONE FACT rather than two separate memories. For such a pair the newer id is KEEP and the older id is DROP (case 3 above). Judge each pair; if the two really are different facts, leave them alone.
-- A kept memory must end up with 1-3 keywords. A keyword is at most 8 Chinese characters or 8 english words.
+- A kept memory ends up with exactly ONE keyword. A keyword is at most 8 Chinese characters or 8 english words. If you merge two memories whose keywords differ, keep the one a future session would search for.
 - Prefer the more complete version of the text when you merge; keep concrete details (paths, commands, versions) and drop repetition.
 - If there is nothing to merge, respond with exactly: NOTHING_TO_MERGE`;
 

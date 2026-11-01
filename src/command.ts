@@ -61,6 +61,6 @@ export const MEMORY_USAGE = [
 	"/memory show              — keyword index, health counters + consolidation watermark (both layers)",
 	"/memory compact project   — merge duplicate memories in this project's layer",
 	"/memory compact user      — merge duplicate memories in the user (global) layer",
-	"/memory rebuild project   — re-derive this project's keywords, then its index",
-	"/memory rebuild user      — re-derive the user (global) keywords, then its index",
+	"/memory rebuild project   — re-derive one keyword per this project's memory, then its index",
+	"/memory rebuild user      — re-derive one keyword per user (global) memory, then its index",
 ].join("\n");

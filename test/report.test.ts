@@ -30,11 +30,11 @@ test("wrapKeywords indents and wraps without exceeding the width", () => {
 });
 
 test("report lists both layers, counts and file paths", () => {
-	const entries = [mk("20261001-aaaa", ["deploy", "rsync"], "SECRETBODY"), mk("20261002-bbbb", ["macos"], "ALSOBODY", "global")];
+	const entries = [mk("20261001-aaaa", ["deploy"], "SECRETBODY"), mk("20261002-bbbb", ["macos"], "ALSOBODY", "global")];
 	const text = buildMemoryReport(entries, { ...base, projectName: "myrepo" });
 	assert.match(text, /^pi-memory-auto · keyword index/);
 	assert.match(text, /global — 1 memory · 1 keyword · sinceLast=0\/20/);
-	assert.match(text, /project: myrepo — 1 memory · 2 keywords · sinceLast=0\/20/);
+	assert.match(text, /project: myrepo — 1 memory · 1 keyword · sinceLast=0\/20/);
 	assert.match(text, /#deploy/);
 	assert.match(text, /file: \/g\/MEMORY.md/);
 	assert.match(text, /file: \/p\/\.pi\/agent\/memory-auto\/MEMORY\.md/);

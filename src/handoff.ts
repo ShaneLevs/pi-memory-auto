@@ -21,10 +21,10 @@ Output format — at most 2 entries:
 ===ENTRY===
 FILE: <USER.md | TOOLING.md | LESSONS.md | CONVENTIONS.md | DECISIONS.md | FAILURES.md>
 LAYER: <global | project>
-TAGS: <1-3 comma separated keywords>
+TAGS: <one keyword>
 TEXT: <the memory text, concise, self-contained>
 
-Every entry needs 1-3 keywords: the terms a future session would search for (at most 8 Chinese characters or 8 english words each).
+Every entry needs EXACTLY ONE keyword: the single term a future session would search for (at most 8 Chinese characters or 8 english words).
 
 If nothing is worth saving, respond with exactly: NOTHING_TO_SAVE`;
 
@@ -64,9 +64,9 @@ export async function runHandoff(
 	if (!result.ok) return { written, ok: false };
 
 	for (const c of parseReviewResponse(result.text, deps.projectRoot)) {
-		// Merge the handoff marker into the keyword budget instead of appending a
-		// 4th keyword: the 1-3 contract is what the index depends on, and a
-		// shared "handoff" keyword on every extracted entry is pure index noise.
+		// The single-keyword contract leaves no room for a "handoff" marker: a
+		// shared keyword on every extracted entry is pure index noise anyway, and
+		// sanitizeKeywords would drop it. c.tags is already one keyword.
 		const { keywords } = sanitizeKeywords([...c.tags, "handoff"]);
 		const outcome = await appendEntry(c.target, c.text, {
 			tags: keywords.length > 0 ? keywords : c.tags,

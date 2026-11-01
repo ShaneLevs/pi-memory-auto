@@ -2,11 +2,16 @@
  * Keyword rules — the contract for what a keyword is.
  *
  * Rules (product spec):
- * - Every memory has 1–3 keywords (never zero).
+ * - Every memory has exactly ONE keyword (never zero, never more).
  * - A keyword is at most 8 characters (CJK) or 8 words (latin).
- * - Keywords are unique *per layer* in MEMORY.md, but many memories may share
- *   one keyword, and one memory may have several.
+ * - Keywords are unique *per layer* in MEMORY.md; many memories may share one.
  * - A layer's keyword table holds at most 200 keywords.
+ *
+ * Why one: the index is a topic map, not a summary. A model asked for "1-3"
+ * almost always spends the whole budget, which triples the index size for the
+ * same number of memories and buries the strong hook in two weak ones. One
+ * keyword per memory also makes the `(N)` count in MEMORY.md mean exactly
+ * "N memories are about this", which is what makes the table readable.
  *
  * Two forms per keyword:
  * - `key`: the canonical matching form — lowercase, all separators removed, so
@@ -16,10 +21,10 @@
  *   into '-', separators otherwise preserved (camelCase stays readable).
  */
 
-/** Minimum keywords per memory. */
+/** Min/max keywords per memory — exactly one. */
 export const MIN_KEYWORDS = 1;
 /** Maximum keywords per memory. */
-export const MAX_KEYWORDS = 3;
+export const MAX_KEYWORDS = 1;
 /** Maximum characters for a CJK keyword. */
 export const MAX_CJK_CHARS = 8;
 /** Maximum words for a latin (whitespace-separated) keyword. */
@@ -76,15 +81,21 @@ export interface SanitizeResult {
 	keywords: string[];
 	/** Rejected candidates with the reason (for tool errors / logs). */
 	issues: string[];
+	/** Valid keywords dropped because the budget was already full. */
+	dropped: number;
 }
 
 /**
  * Normalize, validate and cap a keyword list.
  *
- * Each candidate is split first (see splitTagCandidates): a model that answers
- * `TAGS: memory-write #tool-quirk` or `a, b` must yield two keywords, never one
- * blob. Each surviving keyword is validated, deduped by canonical key and the
- * list is capped at MAX_KEYWORDS.
+ * Each candidate is split first (see splitTagCandidates), so a model answering
+ * `TAGS: memory-write #tool-quirk` or `a, b` never stores one glued blob. Each
+ * surviving keyword is validated, deduped by canonical key and the list is
+ * capped at MAX_KEYWORDS.
+ *
+ * Going over the cap is NOT an error: a model that answers with three keywords
+ * keeps the first and the rest are counted in `dropped`. Rejecting the call
+ * instead would cost a full round-trip to learn what the cap already knows.
  *
  * Never throws; the caller decides whether an empty result is fatal.
  */
@@ -92,6 +103,7 @@ export function sanitizeKeywords(raw: readonly string[]): SanitizeResult {
 	const keywords: string[] = [];
 	const issues: string[] = [];
 	const seen = new Set<string>();
+	let dropped = 0;
 	for (const candidate of raw.flatMap((t) => splitTagCandidates(t))) {
 		const display = keywordDisplay(candidate);
 		const key = keywordKey(candidate);
@@ -106,13 +118,13 @@ export function sanitizeKeywords(raw: readonly string[]): SanitizeResult {
 			continue;
 		}
 		if (keywords.length >= MAX_KEYWORDS) {
-			issues.push(`"${candidate.trim()}": more than ${MAX_KEYWORDS} keywords`);
+			dropped++;
 			continue;
 		}
 		seen.add(key);
 		keywords.push(display);
 	}
-	return { keywords, issues };
+	return { keywords, issues, dropped };
 }
 
 /**
@@ -144,7 +156,7 @@ export function splitTagCandidates(raw: string): string[] {
 }
 
 export interface CoerceResult {
-	/** Keywords that satisfy the contract (1-3, each valid), in input order. */
+	/** Keywords that satisfy the contract (exactly one, valid). */
 	keywords: string[];
 	/** The stored tag field violated the contract and should be rewritten. */
 	changed: boolean;
@@ -153,11 +165,12 @@ export interface CoerceResult {
 }
 
 /**
- * Repair a stored tag list: split dirty separators, validate each keyword, cap
- * at MAX_KEYWORDS, and derive one from the body when nothing survives.
+ * Repair a stored tag list: split dirty separators, validate each keyword, keep
+ * the first, and derive one from the body when nothing survives.
  *
- * Read-path only — it never writes. `changed` tells a migration pass whether the
- * entry still needs rewriting on disk.
+ * Read-path only — it never writes. An entry stored with three keywords (the
+ * old contract) therefore reaches the index as one keyword; `changed` is true
+ * for it, which is what `/memory rebuild` reports as "collapsed".
  */
 export function coerceKeywords(tags: readonly string[], text = ""): CoerceResult {
 	const candidates = tags.flatMap((t) => splitTagCandidates(t));

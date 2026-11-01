@@ -3,13 +3,15 @@
  *
  * The index is the only memory content that enters the context window, so a bad
  * keyword costs a whole memory its reachability. Stored keywords can rot:
- * legacy tags were space-separated (`#a #b #c` as one tag), the old extractor
- * could emit four, and nothing forces a keyword that a future session would
- * actually search for.
+ * legacy tags were space-separated (`#a #b #c` as one tag), the pre-1.0 contract
+ * allowed three keywords per memory, and nothing forces a keyword that a future
+ * session would actually search for.
  *
- * `/memory rebuild` therefore re-derives keywords for EVERY entry with the
- * session model and writes the results back into the entry metadata, keeping a
- * `.bak` of each rewritten file. It is model work, so it is explicit (a command)
+ * `/memory rebuild` therefore re-derives ONE keyword per entry with the session
+ * model and writes the results back into the entry metadata, keeping a `.bak` of
+ * each rewritten file. Rebuild is also the migration path for the old 1-3
+ * contract: an entry stored with three keywords is collapsed to the single best
+ * one (reported as `collapsed`). It is model work, so it is explicit (a command)
  * and never runs in the background.
  *
  * Failure is safe: an entry the model skipped or answered badly keeps its
@@ -18,7 +20,7 @@
  */
 
 import { CLASSIFICATION_RUBRIC, MAIN_FILE } from "./constants.ts";
-import { MAX_KEYWORDS, coerceKeywords, deriveKeyword, keywordKey, sanitizeKeywords } from "./keywords.ts";
+import { MAX_KEYWORDS, coerceKeywords, deriveKeyword, keywordKey, sanitizeKeywords, splitTagCandidates } from "./keywords.ts";
 import { completeWithSessionModel } from "./llm.ts";
 import { applyTagUpdates, type ApplyDeps } from "./store.ts";
 import type { MemoryEntry } from "./types.ts";
@@ -38,24 +40,24 @@ ${CLASSIFICATION_RUBRIC}
 A keyword is the ONLY thing a future session sees in its memory index — the body is not in context. So a keyword must be what a future session would search for when this memory is relevant.
 
 Rules:
-- Give every entry 1-3 keywords (never zero, never more than three).
-- Each keyword is at most 8 Chinese characters or 8 English words. No spaces inside a keyword: join words with '-' (e.g. "turn-counting").
+- Give every entry EXACTLY ONE keyword. The index has one line per keyword, so a second keyword per memory doubles the list without making the memory easier to find — pick the single best hook.
+- A keyword is at most 8 Chinese characters or 8 English words. No spaces inside a keyword: join words with '-' (e.g. "turn-counting").
 - Prefer concrete, distinctive terms: file names, library/tool names, error strings, project names, the user's own wording. Add a Chinese keyword when the memory itself is about Chinese-language work or the user's phrase is more precise in Chinese.
 - A keyword must be useful for FINDING the memory, not a summary of it: "deploy", "rsync", "serialize-conversation" — not "good-practice" or "important".
 - Reuse the existing keyword when it is already good; replace it when it is vague, a whole sentence, or a legacy blob.
 - Do not invent facts, and never store secrets.
 
 Output format — one line per memory, in the order given, nothing else:
-<id> | <keyword>, <keyword>`;
+<id> | <keyword>`;
 
 /** Build one batch prompt. */
 export function buildRekeyPrompt(entries: { entry: MemoryEntry; file: string }[]): string {
 	const blocks = entries.map(({ entry, file }) => {
 		const body = entry.text.length > MAX_BODY_CHARS ? `${entry.text.slice(0, MAX_BODY_CHARS)}…` : entry.text;
 		const current = entry.tags.length > 0 ? entry.tags.join(", ") : "(none)";
-		return `[${entry.id}] ${entry.layer} · ${file}\ncurrent keywords: ${current}\n${body}`;
+		return `[${entry.id}] ${entry.layer} · ${file}\ncurrent keyword${entry.tags.length > 1 ? "s" : ""}: ${current}\n${body}`;
 	});
-	return `<memories>\n${blocks.join("\n\n")}\n</memories>\n\nAssign keywords to every memory above. One line per memory: <id> | <keyword>, <keyword>`;
+	return `<memories>\n${blocks.join("\n\n")}\n</memories>\n\nAssign one keyword to every memory above. One line per memory: <id> | <keyword>`;
 }
 
 export interface RekeyParsed {
@@ -69,8 +71,9 @@ export interface RekeyParsed {
  * Parse `<id> | kw1, kw2` lines.
  *
  * Unknown ids are ignored, a keyword list that sanitizes to nothing is reported
- * as rejected (the caller keeps the stored keywords), and at most MAX_KEYWORDS
- * survive per entry.
+ * as rejected (the caller keeps the stored keywords), and only the FIRST valid
+ * keyword survives — a model that still answers with three is answering an old
+ * contract, and the first one is its own best guess.
  */
 export function parseRekeyResponse(response: string, byId: Map<string, MemoryEntry>): RekeyParsed {
 	const updates: RekeyParsed["updates"] = [];
@@ -104,6 +107,10 @@ export function parseRekeyResponse(response: string, byId: Map<string, MemoryEnt
 export interface RekeyResult {
 	/** Entries whose stored keywords were rewritten. */
 	updated: number;
+	/** Of `updated`, entries that stored MORE than one keyword before the pass
+	 *  and now hold one — the 1-3 → 1 migration, reported separately because it
+	 *  is the reason `/memory rebuild` is run after upgrading. */
+	collapsed: number;
 	/** Files rewritten (each keeps a .bak). */
 	changedFiles: number;
 	/** Entries left as they were (model skipped them / answer unusable). */
@@ -119,7 +126,7 @@ export async function runKeywordRekey(
 	registry: unknown,
 	opts: { onProgress?: (done: number, total: number) => void } = {},
 ): Promise<RekeyResult> {
-	const result: RekeyResult = { updated: 0, changedFiles: 0, unchanged: 0, agreed: 0 };
+	const result: RekeyResult = { updated: 0, collapsed: 0, changedFiles: 0, unchanged: 0, agreed: 0 };
 	if (entries.length === 0) return result;
 
 	// Proposed keywords per entry id, applied only after the full pass so a
@@ -147,7 +154,7 @@ export async function runKeywordRekey(
 	}
 
 	// Group the rewrites per file so each file is read-modify-written once.
-	const byFile = new Map<string, { layer: MemoryEntry["layer"]; file: string; updates: Map<string, string[]> }>();
+	const byFile = new Map<string, { layer: MemoryEntry["layer"]; file: string; updates: Map<string, string[]>; collapsed: number }>();
 	for (const { entry, file } of ordered) {
 		if (file.endsWith(`/${MAIN_FILE}`)) continue; // derived state, never rewritten
 		const keywords = proposed.get(entry.id) ?? repairLocally(entry);
@@ -159,8 +166,12 @@ export async function runKeywordRekey(
 		const layer = (parsed[0] === "global" ? "global" : "project") as MemoryEntry["layer"];
 		const name = (parsed[1] ?? file).replace(/\.md$/i, "");
 		const key = `${layer}/${name}`;
-		const bucket = byFile.get(key) ?? { layer, file: name, updates: new Map<string, string[]>() };
+		// A stored entry carrying more than one keyword is the old 1-3 contract
+		// (including a legacy `#a #b #c` blob, which is one tag but three
+		// keywords): this rewrite collapses it to one, which the caller reports.
+		const bucket = byFile.get(key) ?? { layer, file: name, updates: new Map<string, string[]>(), collapsed: 0 };
 		bucket.updates.set(entry.id, keywords);
+		if (storedKeywordCount(entry) > 1) bucket.collapsed++;
 		byFile.set(key, bucket);
 	}
 
@@ -173,10 +184,20 @@ export async function runKeywordRekey(
 		if (!applied.changed) continue;
 		result.changedFiles++;
 		result.updated += applied.updated;
+		// applyTagUpdates may legitimately write fewer rows than it was handed
+		// (an id that vanished, an identical rewrite), so the bucket count is a
+		// ceiling; clamp it to what the file actually reports.
+		result.collapsed += Math.min(bucket.collapsed, applied.updated);
 	}
 	result.unchanged = ordered.length - result.agreed - result.updated;
 	if (result.unchanged < 0) result.unchanged = 0;
 	return result;
+}
+
+/** How many keywords the stored tag field really carries (a legacy
+ *  `#a #b #c` blob counts as three, not one). */
+function storedKeywordCount(entry: MemoryEntry): number {
+	return entry.tags.reduce((n, tag) => n + Math.max(1, splitTagCandidates(tag).length), 0);
 }
 
 /** Deterministic repair when the model gave nothing usable for an entry. */

@@ -50,14 +50,15 @@ Output format — respond with entries, one block per memory, nothing else:
 ===ENTRY===
 FILE: <USER.md | TOOLING.md | LESSONS.md | CONVENTIONS.md | DECISIONS.md | FAILURES.md>
 LAYER: <global | project>
-TAGS: <1-3 comma separated keywords>
+TAGS: <one keyword>
 SUPERSEDES: <ids of existing memories this entry replaces, comma separated, or ->
 TEXT: <the memory text, concise, self-contained, one sentence to one short paragraph>
 
 Rules:
 - Follow the classification guide above strictly.
 - At most 3 entries per review; quality over quantity.
-- Every entry needs 1-3 keywords: the terms a future session would search for. Reuse an existing keyword when it fits instead of inventing a synonym. Each keyword is at most 8 Chinese characters or 8 english words.
+- Every entry needs EXACTLY ONE keyword: the single term a future session would search for. Reuse an existing keyword when it fits instead of inventing a synonym. A keyword is at most 8 Chinese characters or 8 english words.
+- The keyword is the only part of the memory that carries over into future context, so it has to be a hook a future session would actually type ("部署", "deploy", "serialize-conversation"), not a summary ("good-practice").
 - SUPERSEDES takes at most 2 ids, copied literally from the "Existing memories" list, and only when the
   new entry says the same thing differently or replaces what they claimed. The old entries are kept on
   disk, stop being injected, and rank below the new one — nothing is deleted, so prefer superseding over

@@ -68,7 +68,8 @@ NOTHING_TO_SAVE noise should not leak as entry`;
 	assert.equal(parsed.length, 2);
 	assert.equal(parsed[0]!.target.file, "FAILURES");
 	assert.equal(parsed[0]!.target.layer, "project");
-	assert.deepEqual(parsed[0]!.tags, ["bug", "ci"]);
+	// One keyword per memory: the model's second keyword is dropped, not stored.
+	assert.deepEqual(parsed[0]!.tags, ["bug"]);
 	assert.equal(parsed[1]!.target.file, "TOOLING");
 	assert.equal(parsed[1]!.target.layer, "global");
 });

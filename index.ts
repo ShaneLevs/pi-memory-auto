@@ -275,8 +275,8 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 		name: "memory_write",
 		label: "Memory Write",
 		description: [
-			"Save a durable memory for future sessions. Appends one entry to a category file and adds its keywords to the layer's MEMORY.md index.",
-			"Keywords (1-3, required): they are the ONLY thing a future session sees in its memory index, and they are how it finds this entry again. Pick the terms that session would search for — include the user's language AND the English equivalent when they differ (e.g. \"部署\", \"deploy\"), plus file names, library names, or error strings. Reuse an existing keyword when it fits. Each keyword: at most 8 Chinese characters or 8 english words.",
+			"Save a durable memory for future sessions. Appends one entry to a category file and adds its keyword to the layer's MEMORY.md index.",
+			"Keyword (exactly one, required): it is the ONLY thing a future session sees in its memory index, and it is how it finds this entry again. Pick the single term a future session would search for — include the user's language AND the English equivalent when they differ (e.g. \"部署\", \"deploy\"), plus file names, library names, or error strings. Reuse an existing keyword when it fits. At most 8 Chinese characters or 8 english words. Passing several stores only the first.",
 			"Classification guide (follow strictly):",
 			CLASSIFICATION_RUBRIC,
 			"Notes:",
@@ -291,8 +291,13 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 			text: Type.String({ description: "The memory text. Concise, self-contained, durable. One entry." }),
 			tags: Type.Array(Type.String(), {
 				minItems: 1,
-				maxItems: MAX_KEYWORDS,
-				description: "1-3 retrieval keywords: what a future session would search for. Bilingual when the languages differ.",
+				// Tolerance, not the contract: the schema accepts up to SCHEMA_KEYWORD_SLOTS
+				// so a model that answers with three still lands a write (the first keyword
+				// is stored and the rest are reported as ignored). maxItems: MAX_KEYWORDS
+				// would make the harness reject the call outright, costing a round-trip for
+				// something the tool already knows how to fix.
+				maxItems: SCHEMA_KEYWORD_SLOTS,
+				description: "Exactly one retrieval keyword: the term a future session would search for. Bilingual when the languages differ — pick the side the user would actually type. Extra entries are ignored.",
 			}),
 			supersedes: Type.Optional(
 				Type.Array(Type.String(), {
@@ -311,16 +316,16 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 					isError: true,
 				};
 			}
-			const { keywords, issues } = sanitizeKeywords(params.tags);
+			const { keywords, issues, dropped } = sanitizeKeywords(params.tags);
 			if (issues.length > 0) {
 				return {
 					content: [
 						{
 							type: "text" as const,
-							text: `Keyword rejected:\n${issues.map((i) => `- ${i}`).join("\n")}\n\nRules: 1-${MAX_KEYWORDS} keywords per memory; each at most 8 Chinese characters or 8 english words; no duplicates. Send the call again with corrected keywords.`,
+							text: `Keyword rejected:\n${issues.map((i) => `- ${i}`).join("\n")}\n\nRules: exactly one keyword per memory; at most 8 Chinese characters or 8 english words. Send the call again with a corrected keyword.`,
 						},
 					],
-					details: { summary: "keywords rejected" },
+					details: { summary: "keyword rejected" },
 					isError: true,
 				};
 			}
@@ -371,7 +376,7 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 			else await syncIndexesNow();
 			const replacedNote = replaced ? ` · ${replaced}` : "";
 			return {
-				content: [{ type: "text" as const, text: `Saved to ${outcome.file} [${entry.id}] ${entry.time} keywords: ${entry.tags.join(",")}${replacedNote}` }],
+				content: [{ type: "text" as const, text: `Saved to ${outcome.file} [${entry.id}] ${entry.time} keyword: ${entry.tags.join(",")}${replacedNote}${ignoredNote(dropped)}` }],
 				details: { summary: `saved ${outcome.file}`, entryId: entry.id, deduped: false } as { summary: string; entryId?: string; deduped?: boolean },
 			};
 		},
@@ -389,8 +394,8 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 		{ value: "show", label: "show", description: "Print both layers' keyword index and consolidation watermark" },
 		{ value: "compact project", label: "compact project", description: "Merge duplicate memories in this project's layer" },
 		{ value: "compact user", label: "compact user", description: "Merge duplicate memories in the user (global) layer" },
-		{ value: "rebuild project", label: "rebuild project", description: "Re-derive this project's keywords with the model, then its index" },
-		{ value: "rebuild user", label: "rebuild user", description: "Re-derive the user (global) keywords with the model, then its index" },
+		{ value: "rebuild project", label: "rebuild project", description: "Re-derive one keyword per memory in this project with the model, then its index" },
+		{ value: "rebuild user", label: "rebuild user", description: "Re-derive one keyword per user (global) memory with the model, then its index" },
 	];
 
 	pi.registerCommand("memory", {
@@ -431,16 +436,17 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 				const withModel = Boolean(model && registry);
 				let summary = "";
 				if (entries.length > 0) {
-					if (withModel) ctx.ui.notify(`memory: re-extracting ${label} keywords for ${entries.length} ${entries.length === 1 ? "memory" : "memories"}…`, "info");
+					if (withModel) ctx.ui.notify(`memory: re-deriving one ${label} keyword for ${entries.length} ${entries.length === 1 ? "memory" : "memories"}…`, "info");
 					try {
 						const rekeyed = await runKeywordRekey(writeDeps(), entries, model, registry, {
 							onProgress: (done, total) => {
 								if (ctx.hasUI && done < total) ctx.ui.notify(`memory: ${label} keywords ${done}/${total}…`, "info");
 							},
 						});
+						const collapsed = rekeyed.collapsed > 0 ? ` (${rekeyed.collapsed} collapsed from multiple keywords)` : "";
 						summary = withModel
-							? ` · keywords re-derived: ${rekeyed.updated} changed, ${rekeyed.agreed} already good, ${rekeyed.unchanged} kept`
-							: ` · no session model: repaired ${rekeyed.updated} malformed keyword list${rekeyed.updated === 1 ? "" : "s"} only`;
+							? ` · keywords re-derived: ${rekeyed.updated} changed${collapsed}, ${rekeyed.agreed} already good, ${rekeyed.unchanged} kept`
+							: ` · no session model: repaired ${rekeyed.updated} malformed keyword list${rekeyed.updated === 1 ? "" : "s"} only${collapsed}`;
 					} catch (error) {
 						ctx.ui.notify(`memory: ${label} keyword re-extraction failed — ${error instanceof Error ? error.message : String(error)}`, "error");
 					}
@@ -645,5 +651,21 @@ export default function piMemoryAuto(pi: ExtensionAPI) {
 // Local import kept at bottom to avoid a top-level name clash in the factory.
 import path from "node:path";
 
+/** How many keyword slots the `memory_write` schema tolerates (see the tags
+ *  field). Anything past the first is dropped by `sanitizeKeywords`. */
+const SCHEMA_KEYWORD_SLOTS = 3;
+
 /** Max time the quit-flush review may take; keeps session exit snappy. */
 const SHUTDOWN_FLUSH_TIMEOUT_MS = Math.min(30_000, LLM_TIMEOUT_MS);
+
+/**
+ * Tell the model its extra keywords were dropped, once.
+ *
+ * The cap is one, so a model that still answers with three (prompting rot, or a
+ * cached instruction) succeeds and silently loses two. Saying so in the tool
+ * result is what makes the next call cheaper rather than a repeat.
+ */
+function ignoredNote(dropped: number): string {
+	if (dropped <= 0) return "";
+	return ` · ${dropped} extra keyword${dropped === 1 ? "" : "s"} ignored (one keyword per memory)`;
+}

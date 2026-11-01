@@ -27,7 +27,7 @@ const registry = (text: string) => ({
 	complete: async () => ({ content: [{ type: "text", text }], stopReason: "stop" }),
 });
 
-test("handoff keeps the keyword contract (the 'handoff' marker is not a 4th keyword)", async () => {
+test("handoff keeps the keyword contract (one keyword; the 'handoff' marker is not added)", async () => {
 	const { globalDir, projectRoot, deps } = await setup();
 	const response = `===ENTRY===
 FILE: LESSONS.md
@@ -38,24 +38,11 @@ TEXT: Back up the previous release before rsync --delete.`;
 	assert.equal(ok, true);
 	assert.equal(written.length, 1);
 	assert.ok(written[0]!.tags.length <= MAX_KEYWORDS, `got ${written[0]!.tags.length} keywords`);
-	assert.deepEqual(written[0]!.tags, ["deploy", "rsync", "backup"]);
+	assert.deepEqual(written[0]!.tags, ["deploy"]);
 
 	const after = await loadAllEntries(globalDir, projectRoot);
 	assert.equal(after.length, 1);
-	assert.deepEqual(after[0]!.entry.tags, ["deploy", "rsync", "backup"]);
-});
-
-test("handoff still adds the marker when there is keyword budget for it", async () => {
-	const { globalDir, projectRoot, deps } = await setup();
-	const response = `===ENTRY===
-FILE: LESSONS.md
-LAYER: global
-TAGS: deploy
-TEXT: Back up before rsync --delete.`;
-	const { written } = await runHandoff(deps, "transcript", {}, registry(response));
-	assert.deepEqual(written[0]!.tags, ["deploy", "handoff"]);
-	const after = await loadAllEntries(globalDir, projectRoot);
-	assert.equal(after.length, 1);
+	assert.deepEqual(after[0]!.entry.tags, ["deploy"]);
 });
 
 test("handoff writes nothing for an empty transcript", async () => {

@@ -10,7 +10,7 @@
  * - one line per canonical keyword key, so `serializeConversation` and
  *   `serialize-conversation` cannot both appear
  * - many memories may share a keyword (the count is shown); one memory may
- *   have 1–3 keywords
+ *   have exactly one keyword
  * - at most MAX_KEYWORDS_PER_LAYER keywords; the least-used ones are dropped
  * - deterministic: same entries → same bytes, so the session snapshot is stable
  */
@@ -85,6 +85,9 @@ export interface LayerIndex {
  * derived from the text — the index never loses reachability.
  */
 export function entryKeywords(entry: MemoryEntry): { keywords: string[]; derived: boolean } {
+	// coerceKeywords applies the contract itself (one keyword per memory), so the
+	// index never lists a second hook for the same entry — an old 1-3 entry
+	// contributes only the keyword MEMORY.md would advertise for it.
 	const { keywords, derived } = coerceKeywords(entry.tags, entry.text);
 	const out: string[] = [];
 	const seen = new Set<string>();

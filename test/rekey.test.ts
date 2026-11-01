@@ -63,21 +63,22 @@ test("buildRekeyPrompt shows ids, current keywords and truncated bodies", () => 
 test("parseRekeyResponse accepts plain lines, tolerates bullets and brackets", () => {
 	const byId = new Map([entry("20261001-aaaa", ["old"], "x").entry, entry("20261002-bbbb", ["old"], "y").entry].map((e) => [e.id, e]));
 	const parsed = parseRekeyResponse(
-		["- [20261001-aaaa] | deploy, rsync", "* 20261002-bbbb | serialize-conversation", "20261003-zzzz | nope"].join("\n"),
+		["- [20261001-aaaa] | deploy", "* 20261002-bbbb | serialize-conversation", "20261003-zzzz | nope"].join("\n"),
 		byId,
 	);
 	assert.deepEqual(parsed.updates, [
-		{ id: "20261001-aaaa", keywords: ["deploy", "rsync"] },
+		{ id: "20261001-aaaa", keywords: ["deploy"] },
 		{ id: "20261002-bbbb", keywords: ["serialize-conversation"] },
 	]);
 	assert.deepEqual(parsed.rejected, []);
 });
 
-test("parseRekeyResponse drops unknown ids and caps at 3 keywords", () => {
+test("parseRekeyResponse drops unknown ids and keeps only the first keyword", () => {
 	const byId = new Map([entry("20261001-aaaa", [], "x").entry].map((e) => [e.id, e]));
 	const parsed = parseRekeyResponse("20261001-aaaa | a1, a2, a3, a4\n20269999-zzzz | ghost", byId);
 	assert.equal(parsed.updates.length, 1);
-	assert.equal(parsed.updates[0]!.keywords.length, MAX_KEYWORDS);
+	assert.equal(MAX_KEYWORDS, 1);
+	assert.deepEqual(parsed.updates[0]!.keywords, ["a1"]);
 	assert.deepEqual(parsed.rejected, []);
 });
 
@@ -95,21 +96,36 @@ test("runKeywordRekey rewrites dirty legacy tags with model output and keeps a .
 	const file = path.join(projectRoot, ".pi/agent/memory-auto/DECISIONS.md");
 	await fs.writeFile(file, `${meta("20261001-aaaa", "#ui-taste #design-feedback #screenshots #verification")}design notes\n\n`, "utf8");
 	const entries = await loadAllEntries(globalDir, projectRoot);
-	const result = await runKeywordRekey(deps, entries, {}, fakeRegistry("20261001-aaaa | ui-taste, design-feedback"));
+	const result = await runKeywordRekey(deps, entries, {}, fakeRegistry("20261001-aaaa | ui-taste"));
 	assert.equal(result.updated, 1);
 	assert.equal(result.changedFiles, 1);
+	// The 4-keyword legacy entry is collapsed to exactly one keyword.
+	assert.equal(result.collapsed, 1);
 	const parsed = parseEntries(await fs.readFile(file, "utf8"));
-	assert.deepEqual(parsed[0]!.tags, ["ui-taste", "design-feedback"]);
+	assert.deepEqual(parsed[0]!.tags, ["ui-taste"]);
 	await fs.stat(`${file}.bak`);
+});
+
+test("rebuild collapses old multi-keyword entries even when it keeps a keyword", async () => {
+	const { projectRoot, globalDir, deps } = await setup();
+	const file = path.join(projectRoot, ".pi/agent/memory-auto/DECISIONS.md");
+	await fs.writeFile(file, `${meta("20261001-aaaa", "deploy,rsync,backup")}Deploy with rsync.\n\n`, "utf8");
+	const entries = await loadAllEntries(globalDir, projectRoot);
+	const result = await runKeywordRekey(deps, entries, {}, fakeRegistry("20261001-aaaa | deploy"));
+	assert.equal(result.updated, 1);
+	assert.equal(result.collapsed, 1);
+	const parsed = parseEntries(await fs.readFile(file, "utf8"));
+	assert.deepEqual(parsed[0]!.tags, ["deploy"]);
 });
 
 test("runKeywordRekey leaves already-good keywords untouched (no rewrite)", async () => {
 	const { projectRoot, globalDir, deps } = await setup();
 	const file = path.join(projectRoot, ".pi/agent/memory-auto/DECISIONS.md");
-	const body = `${meta("20261001-aaaa", "deploy,rsync")}deploy notes\n\n`;
+	// Only a cosmetic difference: the same single keyword, spelled differently.
+	const body = `${meta("20261001-aaaa", "Rsync")}deploy notes\n\n`;
 	await fs.writeFile(file, body, "utf8");
 	const entries = await loadAllEntries(globalDir, projectRoot);
-	const result = await runKeywordRekey(deps, entries, {}, fakeRegistry("20261001-aaaa | rsync, deploy"));
+	const result = await runKeywordRekey(deps, entries, {}, fakeRegistry("20261001-aaaa | rsync"));
 	assert.equal(result.agreed, 1);
 	assert.equal(result.updated, 0);
 	assert.equal(result.changedFiles, 0);
@@ -128,7 +144,8 @@ test("runKeywordRekey repairs locally when the model fails, so no entry loses it
 	const parsed = parseEntries(await fs.readFile(file, "utf8"));
 	assert.ok(parsed[0]!.tags.length >= 1);
 	assert.ok(parsed[0]!.tags.length <= MAX_KEYWORDS);
-	assert.deepEqual(parsed[0]!.tags, ["a", "b", "c"]);
+	// Local repair also applies the one-keyword contract.
+	assert.deepEqual(parsed[0]!.tags, ["a"]);
 });
 
 test("runKeywordRekey batches large stores", async () => {

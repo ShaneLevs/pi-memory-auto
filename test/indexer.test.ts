@@ -30,15 +30,16 @@ test("MEMORY.md is created from entries alone and carries stats", async () => {
 	await writeCategory(dirs.projectRoot, "DECISIONS.md", `${meta("20261001-aaaa", "pnpm,deploy", "proj")}\nUse pnpm.\n`);
 	const stats = await materializeLayer(deps(dirs), "project", await loadAllEntries(dirs.globalDir, dirs.projectRoot));
 	assert.equal(stats.entries, 1);
-	assert.equal(stats.keywords, 2);
+	// One keyword per memory: the stored second keyword does not reach the index.
+	assert.equal(stats.keywords, 1);
 	assert.equal(stats.sinceLast, 0); // first build: the existing entries are the baseline
 	assert.equal(stats.written, true);
 
 	const raw = await fs.readFile(path.join(dirs.projectRoot, ".pi/agent/memory-auto/MEMORY.md"), "utf8");
 	assert.match(raw, /AUTO-GENERATED — do not edit/);
-	assert.match(raw, /<!-- stats: entries=1 keywords=2 sinceLast=0/);
+	assert.match(raw, /<!-- stats: entries=1 keywords=1 sinceLast=0/);
 	assert.match(raw, /#pnpm/);
-	assert.match(raw, /#deploy/);
+	assert.ok(!raw.includes("#deploy"), "only the first keyword is indexed");
 	assert.ok(!raw.includes("Use pnpm."), "the body must not be in the index");
 });
 

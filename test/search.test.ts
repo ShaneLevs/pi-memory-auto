@@ -20,8 +20,8 @@ function mk(id: string, time: string, text: string, tags: string[] = []): { entr
 
 const data = [
 	mk("20260101-aaaa", "2026-01-01 10:00:00", "localStorage tokens cause XSS", ["security"]),
-	mk("20260201-bbbb", "2026-02-01 10:00:00", "Use pnpm in this repo", ["pnpm", "convention"]),
-	mk("20260301-cccc", "2026-03-01 10:00:00", "CI needs --frozen-lockfile", ["ci", "pnpm"]),
+	mk("20260201-bbbb", "2026-02-01 10:00:00", "Use pnpm in this repo", ["pnpm"]),
+	mk("20260301-cccc", "2026-03-01 10:00:00", "CI needs --frozen-lockfile", ["ci"]),
 ];
 
 test("tokenize splits on whitespace/punctuation and drops stopwords", () => {
@@ -78,9 +78,17 @@ test("fallback lists the current project's memories before global ones", () => {
 });
 
 test("tag mode matches any wanted tag, tolerating '#' and substrings", () => {
-	assert.equal(searchEntries(data, "tag", "pnpm", 1, 10).total, 2);
+	assert.equal(searchEntries(data, "tag", "pnpm", 1, 10).total, 1);
 	assert.equal(searchEntries(data, "tag", "#ci", 1, 10).total, 1);
-	assert.equal(searchEntries(data, "tag", "convent", 1, 10).total, 1);
+	assert.equal(searchEntries(data, "tag", "secur", 1, 10).total, 1);
+});
+
+test("an old multi-keyword entry is found by its one indexed keyword", () => {
+	// The 1-3 contract is gone: such an entry reaches the index (and tag search)
+	// as its first keyword, and /memory rebuild is what rewrites the rest away.
+	const legacy = [mk("20260101-aaaa", "2026-01-01 10:00:00", "deploy with rsync", ["deploy", "rsync"])];
+	assert.equal(searchEntries(legacy, "tag", "deploy", 1, 10).total, 1);
+	assert.equal(searchEntries(legacy, "tag", "rsync", 1, 10).total, 0);
 });
 
 test("recent mode sorts by time desc", () => {
@@ -90,8 +98,8 @@ test("recent mode sorts by time desc", () => {
 
 test("all mode fuses keyword + tag + recency", () => {
 	const r = searchEntries(data, "all", "pnpm", 1, 10);
-	assert.ok(r.total >= 2);
-	assert.equal(r.hits[0]!.entry.id, "20260301-cccc");
+	assert.equal(r.total, 1);
+	assert.equal(r.hits[0]!.entry.id, "20260201-bbbb");
 	assert.equal(searchEntries(data, "all", "", 1, 10).total, 3);
 });
 
@@ -110,7 +118,7 @@ test("formatSearchResult includes metadata and pagination hint", () => {
 	const text = formatSearchResult(r, "tag", "ci");
 	assert.match(text, /\[20260301-cccc\]/);
 	assert.match(text, /project\/FAILURES\.md/);
-	assert.match(text, /tags: ci,pnpm/);
+	assert.match(text, /tags: ci/);
 	assert.match(text, /no more pages/);
 });
 

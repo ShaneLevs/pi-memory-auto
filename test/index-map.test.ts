@@ -26,8 +26,15 @@ test("keywords are unique per layer and shared keywords are counted", () => {
 	const deploy = table.rows.find((r) => r.key === "deploy");
 	assert.equal(deploy?.count, 2);
 	assert.equal(table.rows.filter((r) => r.key === "deploy").length, 1);
-	assert.equal(table.total, 2);
+	assert.equal(table.total, 1);
 	assert.equal(table.entryCount, 2);
+});
+
+test("an old multi-keyword entry contributes only its first keyword to the index", () => {
+	const entries = [mk("20261001-aaaa", ["deploy", "rsync", "backup"], "deploy with rsync")];
+	const table = collectKeywords(entries, "project");
+	assert.deepEqual(table.rows.map((r) => r.key), ["deploy"]);
+	assert.equal(table.total, 1);
 });
 
 test("spelling variants collapse into one keyword", () => {
@@ -46,7 +53,8 @@ test("spelling variants collapse into one keyword", () => {
 test("most-shared keywords rank first, then alphabetical", () => {
 	const entries = [
 		mk("20261001-aaaa", ["zeta"], "1"),
-		mk("20261002-bbbb", ["alpha", "zeta"], "2"),
+		mk("20261002-bbbb", ["alpha"], "2"),
+		mk("20261003-cccc", ["zeta"], "3"),
 	];
 	const table = collectKeywords(entries, "project");
 	assert.deepEqual(table.rows.map((r) => r.key), ["zeta", "alpha"]);
@@ -114,10 +122,10 @@ test("counted lines come first, crowded by count (ranking is untouched by packin
 });
 
 test("header shows layer, memory count and keyword count", () => {
-	const entries = [mk("20261001-aaaa", ["a", "b"], "x"), mk("20261002-bbbb", ["b"], "y", { layer: "global" })];
+	const entries = [mk("20261001-aaaa", ["b"], "x"), mk("20261002-bbbb", ["b"], "y", { layer: "global" })];
 	const text = buildMemoryIndex(entries, { budget: 500, projectName: "myrepo" });
 	assert.match(text, /global — 1 memory, 1 keyword/);
-	assert.match(text, /project: myrepo — 1 memory, 2 keywords/);
+	assert.match(text, /project: myrepo — 1 memory, 1 keyword/);
 	// Keyword counts are per layer: #b exists once in each layer, not twice.
 	assert.equal((text.match(/^#b$/gm) ?? []).length, 2);
 	assert.ok(!text.includes("#b (2)"));
@@ -128,7 +136,7 @@ test("deterministic for identical input", () => {
 	assert.equal(buildMemoryIndex(entries, { budget: 900 }), buildMemoryIndex(entries, { budget: 900 }));
 });
 
-test("legacy space-separated tags become individual keywords, not one blob", () => {
+test("legacy space-separated tags become ONE valid keyword, not one blob", () => {
 	// Pre-0.5 data: the whole "#a #b #c" string was stored as a single tag.
 	const entries = [
 		mk("20261001-aaaa", ["#svg #antd-icons #qlmanage"], "icons"),
@@ -137,9 +145,10 @@ test("legacy space-separated tags become individual keywords, not one blob", () 
 	const table = collectKeywords(entries, "project");
 	const displays = table.rows.map((r) => r.display);
 	assert.ok(displays.includes("svg"), "#svg is its own keyword");
-	assert.ok(displays.includes("antd-icons"));
-	assert.ok(displays.includes("qlmanage"));
 	assert.ok(!table.rows.some((r) => r.key.length > 24), "no unsearchable blob keyword");
+	// One keyword per memory: the split yields three valid candidates, the index
+	// keeps the first — the other two are reclaimed by /memory rebuild.
+	assert.equal(table.rows.length, 1);
 	assert.equal(table.rows.find((r) => r.key === "svg")?.count, 2);
 });
 

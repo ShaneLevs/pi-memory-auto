@@ -63,7 +63,7 @@ TO: serialize-conversation`,
 	);
 	assert.equal(plan.merges.length, 1);
 	assert.deepEqual(plan.merges[0]!.dropIds, ["20261002-bbbb"]);
-	assert.deepEqual(plan.merges[0]!.tags, ["merged", "keyword"]);
+	assert.deepEqual(plan.merges[0]!.tags, ["merged"]); // one keyword per memory
 	assert.deepEqual(plan.keywordRenames, [{ from: "serializeConversation", to: "serialize-conversation" }]);
 });
 

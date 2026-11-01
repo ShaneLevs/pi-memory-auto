@@ -36,20 +36,25 @@ test("keywordIssue enforces 8 CJK chars / 8 words", () => {
 	assert.equal(keywordIssue("   "), "keyword is empty");
 });
 
-test("sanitizeKeywords validates, dedupes by key and caps at 3", () => {
+test("sanitizeKeywords keeps the first keyword and counts the rest as dropped", () => {
 	const r = sanitizeKeywords(["部署", "serializeConversation", "serialize-conversation", "deploy", "extra"]);
-	assert.deepEqual(r.keywords, ["部署", "serializeconversation", "deploy"]);
-	assert.equal(r.issues.length, 1); // "extra" exceeded the cap
-	assert.match(r.issues[0]!, /more than 3 keywords/);
+	assert.deepEqual(r.keywords, ["部署"]);
+	// Going over the one-keyword cap is not an error: the extras are dropped, not rejected.
+	assert.deepEqual(r.issues, []);
+	assert.equal(r.dropped, 4); // every valid extra, including the spelling variant
 
 	const bad = sanitizeKeywords(["一二三四五六七八九"]);
 	assert.deepEqual(bad.keywords, []);
 	assert.match(bad.issues[0]!, /9 characters \(max 8\)/);
+	assert.equal(bad.dropped, 0);
 });
 
 test("sanitizeKeywords keeps at most MAX_KEYWORDS", () => {
+	assert.equal(MAX_KEYWORDS, 1);
 	const r = sanitizeKeywords(["a1", "a2", "a3", "a4"]);
 	assert.equal(r.keywords.length, MAX_KEYWORDS);
+	assert.deepEqual(r.keywords, ["a1"]);
+	assert.equal(r.dropped, 3);
 });
 
 test("deriveKeyword prefers backticked identifiers, then latin, then CJK", () => {
@@ -78,20 +83,29 @@ test("splitTagCandidates splits legacy '#'-prefixed blobs but keeps multi-word k
 });
 
 test("sanitizeKeywords never stores a '#' glue blob", () => {
-	assert.deepEqual(sanitizeKeywords(["memory-write-#tool-quirk"]), { keywords: ["memory-write", "tool-quirk"], issues: [] });
-	assert.deepEqual(sanitizeKeywords(["#a #b"]).keywords, ["a", "b"]);
+	assert.deepEqual(sanitizeKeywords(["memory-write-#tool-quirk"]).keywords, ["memory-write"]);
+	// The split still happens, so the extras are counted as dropped (not as one blob).
+	assert.equal(sanitizeKeywords(["memory-write-#tool-quirk"]).dropped, 1);
+	assert.deepEqual(sanitizeKeywords(["#a #b"]).keywords, ["a"]);
+	assert.equal(sanitizeKeywords(["#a #b"]).dropped, 1);
 	// A '#' inside a keyword is still rejected when it reaches validation directly.
 	assert.match(keywordIssue("memory-write-#tool-quirk") ?? "", /contains '#'/);
 });
 
 test("coerceKeywords repairs dirty tags in the read path", () => {
+	// One keyword is the contract, so an old three-keyword entry reaches the
+	// index as its first keyword only — and is flagged as needing a rebuild.
 	const dirty = coerceKeywords(["#a #b #c #d #e"], "body");
-	assert.deepEqual(dirty.keywords, ["a", "b", "c"]);
+	assert.deepEqual(dirty.keywords, ["a"]);
 	assert.equal(dirty.changed, true);
 	assert.equal(dirty.derived, false);
 
-	const clean = coerceKeywords(["deploy", "rsync"], "body");
-	assert.deepEqual(clean.keywords, ["deploy", "rsync"]);
+	const legacy = coerceKeywords(["deploy", "rsync"], "body");
+	assert.deepEqual(legacy.keywords, ["deploy"]);
+	assert.equal(legacy.changed, true);
+
+	const clean = coerceKeywords(["deploy"], "body");
+	assert.deepEqual(clean.keywords, ["deploy"]);
 	assert.equal(clean.changed, false);
 });
 
@@ -104,4 +118,5 @@ test("coerceKeywords derives a keyword when the stored tags are unusable", () =>
 
 test("coerceKeywords never returns more than MAX_KEYWORDS", () => {
 	assert.equal(coerceKeywords(["a", "b", "c", "d", "e"], "x").keywords.length, MAX_KEYWORDS);
+	assert.equal(MAX_KEYWORDS, 1);
 });

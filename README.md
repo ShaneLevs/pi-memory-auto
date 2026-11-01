@@ -13,7 +13,7 @@ and ask for that page.
 
 That is exactly how this works:
 
-- every memory is **one short paragraph plus 1–3 keywords**;
+- every memory is **one short paragraph plus one keyword**;
 - the keywords are all that the agent sees at the start of a session — never the
   paragraphs;
 - when a keyword matches the current work, the agent fetches the paragraph
@@ -22,11 +22,12 @@ That is exactly how this works:
 ## What a memory looks like
 
 > Deploy with rsync and back up the previous release first.
-> `#deploy` `#rsync`
+> `#deploy`
 
-The keywords are the hooks that let a future session find it again. That is why
-they matter more than the wording: pick the words you would search for later,
-in both languages if you switch between them.
+The keyword is the hook that lets a future session find it again. That is why it
+matters more than the wording: pick the single word you would search for later,
+in the language you would actually type it in. One word per memory keeps the card
+list short enough to stay readable.
 
 ## What you see when a session starts
 
@@ -115,13 +116,17 @@ The list only changes between sessions, never mid-conversation.
 | `/memory` | Show the checkup: keyword list, counts, what needs your decision, and where the files are |
 | `/memory compact project` | Merge duplicate memories in **this project** |
 | `/memory compact user` | Merge duplicate memories in **your global notes** |
-| `/memory rebuild project` | Pick better keywords for **this project's** memories, then rebuild its list |
+| `/memory rebuild project` | Pick a better keyword for each of **this project's** memories, then rebuild its list |
 | `/memory rebuild user` | Same, for **your global notes** |
 | `/memory help` | Show this list |
 
 `compact` and `rebuild` need to know which one you mean (`project` or `user`),
 so they refuse to guess — otherwise every project would rewrite your shared
 global notes.
+
+`/memory rebuild` is also how older notes get caught up: memories saved by an
+earlier version could carry up to three keywords, and a rebuild collapses each
+of them to the one that matters.
 
 ## Where memories live
 
@@ -156,17 +161,16 @@ Optional, environment variables, all with sensible defaults:
 
 ## What's new
 
+**1.0.0** — one keyword per memory instead of up to three. The list stays short,
+so the word that actually helps you stands out instead of being buried in two
+weaker ones. Extra keywords are simply ignored rather than rejected, and
+`/memory rebuild project|user` collapses the older multi-keyword notes.
+
 **0.9.0** — two fixes. Long sessions no longer pile up duplicate memories: a
 turn is reviewed at most once, and each review only looks at what is new since
 the last one. And a requirement you changed but never re-saved no longer goes
 unnoticed — memories that contradict each other are detected, shown to the
 model, and the outdated one is retired instead of being followed.
-
-**0.8.0** — the notebook learned to correct itself: repeating a memory puts a
-tick on the old one instead of adding a copy, a wrong memory gets "see the new
-one" rather than being torn out, old memories get a "please re-check" label, and
-the keyword list slowly reorders itself around the words that actually helped.
-`/memory` now also reports what is worth cleaning up.
 
 Older versions: see the [technical documentation](TECHNICAL.md#changelog-detailed).
 

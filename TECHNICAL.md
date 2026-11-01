@@ -30,19 +30,21 @@ in the [README](README.md).
 ## Model
 
 ```
-memory_write(body, keywords[1..3], supersedes?[])
+memory_write(body, keyword, supersedes?[])
       │
       ├─► body      → <layer>/<FILE>.md          (append-only, source of truth)
       │                 · identical body again → seen/last bumped, no new row
       │                 · supersedes: [id]      → old row gains superseded-by (kept)
-      └─► keywords  → <layer>/MEMORY.md          (derived table, program-owned, never read back)
+      └─► keyword   → <layer>/MEMORY.md          (derived table, program-owned, never read back)
 
 memory_search → <layer>/usage.json              (which keywords actually found something)
 
 every N new memories → consolidation (merge duplicates, rename keywords) → rebuild
 ```
 
-- A keyword is **unique per layer**, but many memories may share it and one memory has 1–3.
+- A keyword is **unique per layer**, but many memories may share it. Each memory has **exactly one** — the index is a topic map, not a summary, and a model asked for 1-3 always spends the whole budget.
+- Extra keywords are dropped, not rejected: `memory_write` stores the first one and says how many it ignored, so a model answering with three never costs a round-trip.
+- Entries written under the old 1-3 contract stay valid: they reach the index (and `mode:"tag"` search) by their first keyword, and `/memory rebuild` collapses them on disk.
 - Layer is global (`~/.pi/agent/memory-auto/`) or project (`<project>/.pi/agent/memory-auto/`); read isolation is by location.
 - Everything in `MEMORY.md` is derived from the entries — it can be deleted at any time and is rebuilt on the next write or session start.
 - **`MEMORY.md` is program-owned: never edit it by hand.** The extension rewrites it on every memory write, `/memory rebuild` and consolidation, so a manual line is simply lost on the next write. It is also never read back — injection re-renders the table from the category files, which keeps the injected bytes honest even if the file is stale, missing or damaged. Treat it as a read-only view of derived state.
@@ -182,7 +184,7 @@ Optional trailing fields (absent in the common case, so a normal entry's bytes s
 | `supersedes: <id>,<id>` | On a corrected entry: the entries it replaces. |
 | `superseded-by: <id>` | On a replaced entry: kept on disk, out of the index, ranked last in search. |
 
-- `tags` are the keywords (1–3). They are the retrieval surface.
+- `tags` hold the keyword (exactly one). It is the retrieval surface.
 - Metadata comments are stripped from the injected index and always kept in search results.
 - Ids are shape-checked on read (`YYYYMMDD-xxxx`): a hand-edited or truncated
   file cannot make an entry point at garbage or de-index itself.
@@ -194,15 +196,17 @@ Optional trailing fields (absent in the common case, so a normal entry's bytes s
 
 | Rule | Where it is enforced |
 |---|---|
-| 1–3 per memory | `sanitizeKeywords` on `memory_write` (rejects), `parseReviewResponse` / `runHandoff` (derive or trim), `coerceKeywords` on read + `/memory rebuild` |
+| exactly 1 per memory | `sanitizeKeywords` (keeps the first, counts the rest as `dropped`) on `memory_write` / `parseReviewResponse` / `runHandoff` / consolidation, `coerceKeywords` on read + `/memory rebuild` (which rewrites the old 1-3 rows) |
 | ≤ 8 Chinese characters or 8 english words | `keywordIssue`; the extractor and rekey prompts state it too |
 | Unique per layer | canonical key = lowercase with separators removed (`src/keywords.ts`) |
 | ≤ 200 per layer | `collectKeywords` cap; the lowest-ranked keywords (shared count + recalls) are dropped from the table (their memories stay searchable by text) |
 
 Stored tags are repaired on read (`coerceKeywords`): legacy space-separated
 `#a #b #c` blobs are split back into individual keywords, over-long or invalid
-ones are dropped, and an entry left with nothing gets a keyword derived from its
-body. The read path never writes — `/memory rebuild` is what persists the repair.
+candidates are dropped, only the first survivor is kept, and an entry left with
+nothing gets a keyword derived from its body. The read path never writes —
+`/memory rebuild` is what persists the repair, and it is also the migration path
+that collapses an old multi-keyword row to one (reported as `collapsed`).
 
 ## Injection
 
@@ -429,8 +433,8 @@ sent, and only their files are rewritten.
    `===RENAME===` (keyword synonym) blocks.
 4. Every proposal is validated against the entries that actually exist: unknown
    ids ignored, merges never span layers, self-merges dropped, keywords
-   re-checked against the 1–3 / ≤8 rule, and a memory never ends up without a
-   keyword.
+   re-checked against the one-keyword / ≤8 rule, and a memory never ends up
+   without a keyword.
 5. The plan is applied deterministically (rewriting only the files it touches,
    `.bak` kept) and the watermark is reset.
 
@@ -472,7 +476,7 @@ No vector search — the model does the query expansion (synonyms, translations)
 | `/memory` or `/memory show` | Print both layers' keyword tables, memory/keyword counts, the `sinceLast` watermark, the consolidation marker, the file paths, and the **health line**, **merge candidates** and **possible superseded requirements** with the exact command to act on them. The report is added to the transcript as a custom message (so the agent sees the current index too). |
 | `/memory compact project` | Merge duplicate memories in **this project's layer only**, then reset that layer's watermark. Needs a session model; failure leaves the store untouched. |
 | `/memory compact user` | Same, for the **user (global) layer only**. |
-| `/memory rebuild project` | **Re-derive this project's keywords with the session model**, write them back into the entry metadata (`.bak` kept), then regenerate that layer's `MEMORY.md`. Batched 12 entries per call; without a session model it only repairs malformed tags deterministically. |
+| `/memory rebuild project` | **Re-derive ONE keyword per memory in this project's layer with the session model**, write it back into the entry metadata (`.bak` kept), then regenerate that layer's `MEMORY.md`. Batched 12 entries per call; also the migration path for entries written under the old 1-3 contract (the result reports how many were `collapsed`). Without a session model it only repairs malformed tags deterministically. |
 | `/memory rebuild user` | Same, for the **user (global) layer only**. |
 | `/memory help` | Print the usage list. |
 
@@ -547,6 +551,25 @@ reaches a prompt or a tool description is English; Chinese appears only in desig
 docs.
 
 ## Changelog (detailed)
+
+### 1.0.0
+
+- **One keyword per memory.** The contract is now exactly one keyword instead of
+  1-3. A model asked for "1-3" almost always answers with three, so the index
+  tripled for the same number of memories and the one strong hook was buried in
+  two weak ones; the `(N)` count in `MEMORY.md` also stopped meaning "N memories
+  are about this". `MAX_KEYWORDS` is 1, every prompt states the new rule, and the
+  `memory_write` tool description/schema say so too.
+- **Over-budget keywords are dropped, not rejected.** `sanitizeKeywords` keeps
+  the first valid keyword and counts the rest (`dropped`); `memory_write` stores
+  the entry and appends `· N extra keywords ignored (one keyword per memory)` to
+  its answer. Rejecting the call would cost a whole round-trip to learn what the
+  cap already knows, and a model that got the old prompt still lands a write.
+- **`/memory rebuild` is the migration.** It re-derives one keyword per entry
+  and reports `collapsed` — entries that stored several keywords before the pass
+  (`coerceKeywords` counts `#a #b #c` legacy blobs as three, not one). Reading
+  such an old entry never loses it: it reaches the index and `mode:"tag"` search
+  by its first keyword until a rebuild rewrites it.
 
 ### 0.9.0
 

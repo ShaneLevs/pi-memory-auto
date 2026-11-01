@@ -7,3 +7,6 @@ pi-memory-auto 的 README changelog 只保留最近两个版本小节——发�
 <!-- mid: 20261024-9fd4 | t: 2026-10-24 15:36:22 | p: pi-memory-auto | src: auto | tags: documentation,readme,i18n -->
 Keep `README.md` and `README.zh-CN.md` beginner-friendly and free of implementation detail, keep their structure aligned, and place technical information in `TECHNICAL.md`; ship all three documents in the npm package.
 
+<!-- mid: 20261101-2bd0 | t: 2026-11-01 16:46:59 | p: pi-memory-auto | src: user | tags: 版本号,release,changelog -->
+pi-memory-auto 当前版本 1.0.0（0.9.0 → 1.0.0，因为「1-3 关键词」是破坏性契约变更）。发布流程仍按老规矩：先核对 `package.json` version、git tag、npm 已发布版本三处，README 只保留最近两个版本的「What's new / 新版有什么」小节（加 1.0.0 时删掉 0.8.0 小节），详细记录写进 `TECHNICAL.md` 的 `## Changelog (detailed)`。改版本号/写 changelog/更新 README 都只是文件编辑，不等于授权 commit、tag 或 publish。
+

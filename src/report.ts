@@ -172,7 +172,7 @@ export function buildMemoryReport(entries: IndexInput[], opts: ReportOptions): s
 		"",
 		layerBlock("project", entries, opts.project, opts),
 		"",
-		"/memory compact <project|user> (merge duplicates) · /memory rebuild <project|user> (re-derive keywords)",
+		"/memory compact <project|user> (merge duplicates) · /memory rebuild <project|user> (re-derive each memory's keyword)",
 	];
 	return blocks.join("\n");
 }

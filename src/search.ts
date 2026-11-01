@@ -16,7 +16,7 @@
 
 import { PROJECT_CATEGORY_FILES, GLOBAL_CATEGORY_FILES } from "./constants.ts";
 import { parseEntries, parseTime } from "./entry.ts";
-import { MAX_KEYWORDS, coerceKeywords, keywordKey } from "./keywords.ts";
+import { coerceKeywords, keywordKey } from "./keywords.ts";
 import { daysSinceVerified, isStale, reviewMonthsFor } from "./staleness.ts";
 import { categoryFilePath, memoryDir, readFileOrEmpty } from "./store.ts";
 import type { MemoryEntry, SearchHit, SearchMode, SearchResult } from "./types.ts";
@@ -163,8 +163,10 @@ export function searchEntries(
 			const rawQuery = q.split(/[,\s]+/).filter(Boolean);
 			const wanted = [...new Set(rawQuery.map((t) => keywordKey(t)).filter(Boolean))];
 			for (const loaded of all) {
+				// coerceKeywords already applies the one-keyword contract: a legacy
+				// entry stored with three keywords resolves by its first one, which is
+				// exactly the keyword MEMORY.md advertises for it.
 				const keys = coerceKeywords(loaded.entry.tags, loaded.entry.text).keywords
-					.slice(0, MAX_KEYWORDS)
 					.map((t) => keywordKey(t))
 					.filter(Boolean);
 				let score = 0;
